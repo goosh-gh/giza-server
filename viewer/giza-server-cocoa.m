@@ -268,11 +268,14 @@ static void _update_window(int win_id, const char *png_data, size_t png_len,
     if (!buf) return;
     memcpy(buf, png_data, png_len);
 
-    char  ttl[256] = {0};
-    if (title && title[0]) strncpy(ttl, title, 255);
 
     GsView   *view   = w->view;
     NSWindow *window = w->window;
+
+    /* 配列はブロックにキャプチャできないのでNSStringに変換してからretain */
+    NSString *ns_title = (title && title[0])
+        ? [[NSString stringWithUTF8String:title] retain]
+        : nil;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         NSData  *data = [NSData dataWithBytesNoCopy:buf
@@ -285,10 +288,15 @@ static void _update_window(int win_id, const char *png_data, size_t png_len,
         } else {
             fprintf(stderr, "giza_server: PNG decode failed\n");
         }
-        if (ttl[0]) {
-            [window setTitle:[NSString stringWithUTF8String:ttl]];
+        if (ns_title) {
+            [window setTitle:ns_title];
+            [ns_title release];
         }
     });
+
+
+
+
 }
 
 /* ------------------------------------------------------------------ */
@@ -387,6 +395,7 @@ static void *_handle_connection(void *arg)
         }
 
         case GSP_MSG_TITLE:
+
             /* fire-and-forget: NO ACK (matches GTK backend & protocol spec) */
             if (payload) {
                 size_t len = hdr.length < 255 ? hdr.length : 255;
@@ -394,13 +403,15 @@ static void *_handle_connection(void *arg)
                 title_buf[len] = '\0';
                 if (current_win >= 0) {
                     NSWindow *win = GS.wins[current_win].window;
-                    NSString *ns  = [NSString stringWithUTF8String:title_buf];
+                    NSString *ns  = [[NSString stringWithUTF8String:title_buf] retain];
                     dispatch_async(dispatch_get_main_queue(), ^{
                         [win setTitle:ns];
+                        [ns release];
                     });
                 }
             }
             break;
+
 
         case GSP_MSG_PNG: {
             if (current_win < 0)
