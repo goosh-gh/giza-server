@@ -12,190 +12,142 @@ In PGPLOT, `pgxwin_server` kept plot windows alive after the calling program exi
 |---------|--------------|-------------|
 | Rendering | X11 Pixmap | Cairo (publication quality) |
 | IPC | X atoms + shared memory | Unix-domain socket |
-| GUI toolkit | Xlib/Xt | GTK 3 (Linux) |
-| WSL2 support | No | Yes (no X atoms needed) |
+| GUI toolkit | Xlib/Xt | GTK 3 (Linux) / Cocoa (macOS) |
+| WSL2 / Wayland | No | Yes (no X atoms needed) |
+| macOS native | No | Yes (NSWindow/NSView, v0.2+) |
 
-The calling program (e.g. a Fortran/C/Perl program linked against giza) opens the device
-`/GS` (or `/GIZA_SERVER`), renders frames as PNG into the server via a lightweight
-binary protocol over a Unix-domain socket, and exits.  The server window stays open
-until the user closes it.
+The calling program opens the device `/GS`, renders frames as PNG into the server
+via a lightweight binary protocol over a Unix-domain socket, and exits.  The server
+window stays open until the user closes it.
+
+## Backends
+
+| Platform | Backend | Toolkit |
+|----------|---------|---------|
+| Linux / WSL2 | GTK 3 + Cairo | `libgtk-3-dev` |
+| macOS (Apple Silicon / x86_64) | Cocoa (NSWindow) | system Cocoa.framework |
+
+The backend is detected automatically at configure time (`--with-viewer=auto`).
+You can override with `--with-viewer=gtk` or `--with-viewer=cocoa`.
 
 ## Architecture
 
 ```
-┌─────────────────────────────┐      Unix socket         ┌────────────────────┐
-│  Your program               │  ──────────────────────► │  giza-server       │
-│  (giza /GS driver)          │   binary protocol        │  (GTK 3 viewer)    │
-│                             │   PNG frames, titles,    │                    │
-│  giza → Cairo PNG surface   │   NEWWIN / CLOSE msgs    │  persistent window │
-└─────────────────────────────┘                          └────────────────────┘
+┌─────────────────────────────┐      Unix socket         ┌─────────────────────────┐
+│  Your program               │  ──────────────────────► │  giza-server            │
+│  (giza /GS driver)          │   GSP wire protocol      │  Linux:  GTK 3 viewer   │
+│                             │   PNG frames, titles,    │  macOS:  Cocoa viewer   │
+│  giza → Cairo PNG surface   │   NEWWIN / CLOSE msgs    │                         │
+└─────────────────────────────┘                          │  persistent window(s)   │
+                                                         └─────────────────────────┘
 ```
 
-### Wire protocol
+### Wire protocol (GSP)
 
-A simple length-prefixed binary protocol over a Unix-domain socket:
+16-byte fixed header + payload:
 
+```c
+typedef struct {
+    uint32_t magic;    /* 0x47495A41 "GIZA" */
+    uint8_t  version;
+    uint8_t  type;     /* PNG, NEWWIN, CLOSE, PING/PONG, TITLE ... */
+    uint16_t flags;
+    uint32_t length;   /* payload bytes */
+    uint32_t seq;
+} gsp_header_t;
 ```
-┌──────────┬──────────┬────────────┐
-│  type    │  length  │  payload   │
-│ (uint8)  │ (uint32) │ (n bytes)  │
-└──────────┴──────────┴────────────┘
+
+| Message | Direction | ACK? |
+|---------|-----------|------|
+| `PING`  | client→server | PONG |
+| `NEWWIN` | client→server | ACK |
+| `PNG`   | client→server | ACK |
+| `TITLE` | client→server | **none** (fire-and-forget) |
+| `CLOSE` | client→server | ACK |
+
+## Build
+
+### Linux (GTK 3)
+
+```bash
+# Prerequisites
+sudo apt install libgtk-3-dev libcairo2-dev
+
+# Build
+autoreconf -fi
+./configure            # auto-detects GTK on Linux
+make
+sudo make install
 ```
 
-| Message type | Code | Payload |
-|---|---|---|
-| `MSG_PNG`    | 0x01 | Raw PNG bytes (decoded via `cairo_image_surface_create_from_png`) |
-| `MSG_TITLE`  | 0x02 | UTF-8 window title (not NUL-terminated) |
-| `MSG_NEWWIN` | 0x03 | `uint32 width_px, uint32 height_px` (0 = default) |
-| `MSG_CLOSE`  | 0x04 | *(no payload)* |
-| `MSG_ACK`    | 0x10 | *(no payload)* |
-| `MSG_PING`   | 0x11 | *(no payload)* |
-| `MSG_PONG`   | 0x12 | *(no payload)* |
-| `MSG_ERR`    | 0xFF | UTF-8 error string |
+### macOS (Cocoa)
 
-Maximum PNG payload: 64 MiB per frame.
+```bash
+# No extra dependencies — Cocoa.framework is part of macOS SDK
+
+# Build
+autoreconf -fi
+./configure            # auto-detects Cocoa on macOS
+make
+sudo make install
+```
+
+Force a specific backend:
+
+```bash
+./configure --with-viewer=cocoa    # macOS Cocoa
+./configure --with-viewer=gtk      # GTK 3 (Linux)
+```
+
+## Test
+
+```bash
+make check
+```
+
+- `test/test_ping.sh` — automated ping/pong (no display needed on macOS)
+- `test/test_png.sh`  — visual: red rectangle + white cross in a window
+
+On macOS the Cocoa viewer does not need `DISPLAY`.
+On Linux the GTK viewer requires `DISPLAY` or `WAYLAND_DISPLAY`; tests are
+skipped (exit 77) in headless CI environments.
+
+## macOS Cocoa design notes
+
+The macOS backend (`viewer/giza-server-cocoa.m` + `viewer/giza-server-main.m`)
+follows the same pattern as the giza `/osx` driver (PR #86):
+
+- `giza-server-main.m` **hijacks `main()`**: calls `giza_server_cocoa_init()`
+  (which creates `[NSApplication sharedApplication]`), then launches a POSIX
+  worker thread for the accept loop, and finally calls `[NSApp run]` on the
+  main thread — so `NSApp` always runs on the OS-designated main thread.
+
+- All `NSWindow` / `NSView` operations are dispatched to the main queue via
+  `dispatch_async(dispatch_get_main_queue(), ^{})`, replacing GTK's
+  `g_idle_add()`.
+
+- PNG frames are decoded as `NSImage` from `NSData` in memory (no temp files).
+
+- Windows share a common `tabbingIdentifier` so macOS tab-groups them
+  automatically (same trick as `PDL::Graphics::Cairo`'s `pdlcairo_viewer`).
+
+- `GSP_MSG_TITLE` is fire-and-forget on both backends — **no ACK**.
 
 ## Files
 
 ```
-giza-server/
-├── README.md                          ← this file
-├── configure.ac                       ← autoconf input
-├── Makefile.am                        ← automake input
-├── patches/
-│   └── giza-v1.5.0-drivers.patch     ← patch adding /GS driver to giza
-├── src/
-│   ├── giza-driver-gs.c              ← giza /GS driver (client side)
-│   └── giza-driver-gs-private.h
-└── viewer/
-    ├── giza-server-protocol.h        ← wire protocol definitions
-    └── giza-server-gtk.c             ← GTK 3 persistent viewer (server)
+viewer/
+  giza-server-protocol.h   — GSP wire format (shared by driver + viewer)
+  giza-server-gtk.c        — GTK 3 viewer (Linux)
+  giza-server-cocoa.m      — Cocoa viewer (macOS)
+  giza-server-main.m       — macOS main-thread bootstrapper
+src/
+  giza-driver-gs.c         — /gs device driver (add to libgiza)
+  giza-driver-gs-private.h — driver header
+patches/
+  giza-v1.5.0-drivers.patch — patch for giza upstream
 ```
-
-## Build
-
-### Prerequisites
-
-Install the following before building.  Missing packages are the most common
-cause of `./configure` failures — check these first.
-
-**Ubuntu / Debian:**
-```bash
-sudo apt install \
-    build-essential \
-    autoconf automake libtool \
-    pkg-config \
-    libgtk-3-dev \
-    libcairo2-dev
-```
-
-> **Note:** `autoconf`, `automake`, and `libtool` are needed to run
-> `autoreconf -fi`.  They are not needed when installing from a released tarball.
-
-### Build from source (git clone)
-
-> **Important:** `autoreconf -fi` must be run before `./configure` after
-> cloning the repository, or after editing `configure.ac` / `Makefile.am`.
-> Skipping this step causes build failures that are difficult to diagnose.
-> (This was encountered during giza PR #86, where the maintainer hit exactly
-> this problem on GitHub Actions CI.)
-
-```bash
-git clone https://github.com/goosh-gh/giza-server.git
-cd giza-server
-autoreconf -fi          # REQUIRED — generates configure, Makefile.in, etc.
-./configure
-make
-sudo make install       # installs giza_server to /usr/local/bin
-```
-
-#### Optional: also enable the driver syntax-check (`make check-driver`)
-
-`src/giza-driver-gs.c` is the client-side driver that gets compiled into giza
-itself (via the patch).  To syntax-check it you must tell `./configure` where
-your giza source tree is — **this must be done before `make`**, not after:
-
-```bash
-autoreconf -fi
-./configure --with-giza-src=/path/to/giza/src   # ← specify HERE, before make
-make
-make check-driver
-```
-
-If you forget `--with-giza-src` and run plain `./configure`, `make check-driver`
-will print an error and exit 1 — you will need to re-run `./configure` with the
-option and then `make` again.  There is no way to enable this target after the
-fact without reconfiguring.
-
-### Applying the giza /GS driver patch
-
-To add the `/GS` device to giza itself:
-
-```bash
-cd /path/to/giza
-patch -p1 < /path/to/giza-server/patches/giza-v1.5.0-drivers.patch
-autoreconf -fi          # REQUIRED — same reason as above
-./configure
-make
-```
-
-The patch was developed against **giza v1.5.0**.
-
-## Usage
-
-### Start the server
-
-```bash
-giza_server &
-```
-
-The server listens on a Unix socket at `$XDG_RUNTIME_DIR/giza-server.sock`
-(fallback: `/tmp/giza-server-<uid>.sock`).
-
-### Use from your program
-
-Open the `/GS` or `/GIZA_SERVER` device as you would any giza/PGPLOT device:
-
-```fortran
-! Fortran / PGPLOT
-CALL PGOPEN('/GS')
-```
-
-```c
-/* C / giza */
-giza_open_device("/GS", "My Plot");
-```
-
-```perl
-# Perl / PDL::Graphics::PGPLOT
-my $w = PDL::Graphics::PGPLOT::Window->new(Device => '/GS');
-```
-
-The window stays open after your program exits.  Close it by pressing **Q** or
-closing the window normally.
-
-### Multiple windows
-
-Each call to open the `/GS` device in `NEWWIN` mode creates a new window.
-Up to **64** simultaneous windows are supported.
-
-## Tested platforms
-
-| OS | Architecture | Status |
-|---|---|---|
-| Ubuntu 24.04 | ARM64 | ✅ Working |
-
-## Relationship to giza PR #86
-
-The macOS Cocoa window driver (`/osx`) for giza was submitted as
-[PR #86](https://github.com/danieljprice/giza/pull/86).
-`giza-server` is a separate companion project that adds the persistent-window
-server daemon.
 
 ## License
 
-LGPL-2.1 — the same license as giza itself.
-
-## Author
-
-[goosh-gh](https://github.com/goosh-gh)
+LGPL-2.1 — same as giza itself.

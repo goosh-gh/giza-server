@@ -3,16 +3,12 @@
 #
 # Visual PNG window display test for giza_server.
 #
-# Sends a Cairo-rendered PNG to the server and leaves the window
-# visible for GIZA_TEST_DISPLAY_SECS seconds (default: 5) before
-# shutting down the server and exiting.
+# macOS: no DISPLAY needed (Cocoa backend).
+# Linux: skips if neither DISPLAY nor WAYLAND_DISPLAY is set.
 #
-# In 'make check' the window appears, stays for a few seconds,
-# then the test finishes automatically — no keyboard input needed.
-#
-# Exit 0  = pass (window appeared, ACK received)
+# Exit 0  = pass
 # Exit 1  = fail
-# Exit 77 = skip (no display available)
+# Exit 77 = skip (no display available on Linux)
 
 BINARY=./giza_server
 TEST_PNG=./test/test_png
@@ -22,7 +18,6 @@ SERVER_PID=""
 
 # ------------------------------------------------------------------ #
 cleanup() {
-    # Stop server started by this script (if any)
     if [ -n "$SERVER_PID" ]; then
         echo "INFO: stopping giza_server (pid=$SERVER_PID)"
         kill "$SERVER_PID" 2>/dev/null || true
@@ -33,12 +28,19 @@ cleanup() {
 trap cleanup EXIT
 
 # ------------------------------------------------------------------ #
-# 1. Skip if no display
+# 1. Display check (macOS Cocoa: no DISPLAY needed)
 # ------------------------------------------------------------------ #
-if [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
-    echo "SKIP: no display (DISPLAY/WAYLAND_DISPLAY unset)"
-    exit 77
-fi
+case "$(uname)" in
+    Darwin)
+        : # Cocoa always has a display
+        ;;
+    *)
+        if [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
+            echo "SKIP: no display (DISPLAY/WAYLAND_DISPLAY unset)"
+            exit 77
+        fi
+        ;;
+esac
 
 # ------------------------------------------------------------------ #
 # 2. Check binaries
@@ -54,7 +56,6 @@ fi
 
 # ------------------------------------------------------------------ #
 # 3. Start server if not already running
-#    (test_ping.sh may have left it running)
 # ------------------------------------------------------------------ #
 if [ -S "$SOCK" ]; then
     echo "INFO: reusing running giza_server (socket: $SOCK)"
@@ -82,7 +83,7 @@ echo "INFO: sending PNG frame..."
 "$TEST_PNG"
 
 # ------------------------------------------------------------------ #
-# 5. Keep window visible for inspection, then auto-close
+# 5. Keep window visible, then auto-close
 # ------------------------------------------------------------------ #
 echo ""
 echo "================================================================"

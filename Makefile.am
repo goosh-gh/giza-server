@@ -4,8 +4,6 @@
 #   autoreconf -fi && ./configure
 #
 # autoreconf -fi is REQUIRED — do not skip it.
-# (Lesson from giza PR #86: autoconf/automake/libtool generated files are
-#  libtool-version-dependent; always regenerate, never commit them.)
 
 AUTOMAKE_OPTIONS = foreign
 
@@ -15,6 +13,8 @@ AUTOMAKE_OPTIONS = foreign
 
 bin_PROGRAMS = giza_server
 
+# --- GTK backend (Linux default) ---
+if USE_GTK
 giza_server_SOURCES = \
     viewer/giza-server-gtk.c \
     viewer/giza-server-protocol.h
@@ -26,6 +26,25 @@ giza_server_CFLAGS  = \
 giza_server_LDADD   = \
     $(GTK_LIBS) \
     $(PTHREAD_LIBS)
+endif
+
+# --- Cocoa backend (macOS) ---
+# Two .m files: the viewer logic and the main-thread bootstrapper.
+# Compiled as Objective-C; linked against Cocoa + pthread.
+if USE_COCOA
+giza_server_SOURCES = \
+    viewer/giza-server-cocoa.m \
+    viewer/giza-server-main.m \
+    viewer/giza-server-protocol.h
+
+# -x objective-c is embedded in COCOA_CFLAGS from configure.ac
+giza_server_CFLAGS  = \
+    -I$(srcdir)/viewer \
+    $(COCOA_CFLAGS)
+
+giza_server_LDADD   = \
+    $(COCOA_LIBS)
+endif
 
 # ------------------------------------------------------------------ #
 # Test programs (built by 'make check', not installed)               #
@@ -43,16 +62,10 @@ test_test_png_LDADD    = $(CAIRO_LIBS)
 
 # ------------------------------------------------------------------ #
 # Test suite (automake TESTS)                                         #
-#                                                                     #
-# test_ping.sh: automated ping/pong — starts giza_server itself,     #
-#               no display needed.                                    #
-# test_png.sh:  visual PNG window test — skips (exit 77) if no       #
-#               DISPLAY or WAYLAND_DISPLAY is set.                    #
 # ------------------------------------------------------------------ #
 
 TESTS = test/test_ping.sh test/test_png.sh
 
-# Tell automake these are shell scripts, not compiled programs
 TEST_EXTENSIONS = .sh
 SH_LOG_COMPILER = sh
 
@@ -71,7 +84,6 @@ EXTRA_DIST = \
 
 # ------------------------------------------------------------------ #
 # check-driver: syntax-check the libgiza driver (optional)           #
-# Requires:  ./configure --with-giza-src=DIR                         #
 # ------------------------------------------------------------------ #
 
 .PHONY: check-driver
