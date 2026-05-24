@@ -49,6 +49,36 @@
 - (void)setImage:(NSImage *)img;
 @end
 
+
+
+/* ------------------------------------------------------------------ */
+/* NSApplicationDelegate — AutomaticTermination 無効化                */
+/* ------------------------------------------------------------------ */
+
+@interface GsAppDelegate : NSObject <NSApplicationDelegate>
+@end
+
+@implementation GsAppDelegate
+
+
+- (void)applicationDidFinishLaunching:(NSNotification *)notification
+{
+    (void)notification;
+    [[NSProcessInfo processInfo]
+        disableAutomaticTermination:@"giza_server running"];
+    [[NSProcessInfo processInfo]
+        disableSuddenTermination];
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender
+{
+    (void)sender;
+    return NSTerminateCancel;
+}
+
+
+@end
+
 @implementation GsView
 
 - (instancetype)initWithFrame:(NSRect)frame
@@ -140,23 +170,26 @@ static struct {
 /* Public init — called from main thread before worker starts          */
 /* ------------------------------------------------------------------ */
 
+
 void giza_server_cocoa_init(void)
 {
     memset(&GS, 0, sizeof(GS));
     pthread_mutex_init(&GS.wins_lock, NULL);
     GS.listen_fd = -1;
 
-    /* Build socket path */
     snprintf(GS.sock_path, sizeof(GS.sock_path),
              GIZA_SERVER_SOCK_DIR "/" GIZA_SERVER_SOCK_NAME,
              (int)getuid());
 
-    /* NSApplication singleton */
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    [NSApp finishLaunching];
-    [NSApp activateIgnoringOtherApps:YES];
+
+    GsAppDelegate *delegate = [[GsAppDelegate alloc] init];
+    [NSApp setDelegate:delegate];
+
+    /* finishLaunching は [NSApp run] が内部で呼ぶので明示しない */
 }
+
 
 /* ------------------------------------------------------------------ */
 /* Window creation — must run on main thread                           */
@@ -171,6 +204,7 @@ typedef struct {
 
 static void _create_window_on_main(void *ptr)
 {
+
     NewWinReq *req = ptr;
 
     pthread_mutex_lock(&GS.wins_lock);
@@ -201,36 +235,46 @@ static void _create_window_on_main(void *ptr)
         NSWindowStyleMaskMiniaturizable  |
         NSWindowStyleMaskResizable;
 
+
     NSWindow *win = [[NSWindow alloc]
         initWithContentRect:frame
                   styleMask:style
                     backing:NSBackingStoreBuffered
                       defer:NO];
 
+
     [win setTitle:[NSString stringWithUTF8String:w->title]];
     [win setReleasedWhenClosed:NO];
-
-    /* Tab grouping — all giza_server windows share one tabbing ID */
-    if (@available(macOS 10.12, *)) {
-        win.tabbingIdentifier = @"giza_server_windows";
-        win.tabbingMode       = NSWindowTabbingModePreferred;
-    }
-
     GsView *view = [[GsView alloc] initWithFrame:win.contentView.bounds];
-    [view setAutoresizingMask:
-        NSViewWidthSizable | NSViewHeightSizable];
+    [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [win.contentView addSubview:view];
 
-    w->window = win;    /* retained */
-    w->view   = view;   /* retained */
+    w->window = win;
+    w->view   = view;
+
+
+    [[NSProcessInfo processInfo] disableAutomaticTermination:@"window open"];
 
     [win makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
 
     req->result_id = idx;
     dispatch_semaphore_signal(req->sem);
+
+
+
+    /* Tab grouping — all giza_server windows share one tabbing ID */
+//   if (@available(macOS 10.12, *)) {
+//        win.tabbingIdentifier = @"giza_server_windows";
+//        win.tabbingMode       = NSWindowTabbingModePreferred;
+//    }
+
+
 }
 
 /* Synchronously create a window from a non-main thread               */
+
+
 static int _create_window_sync(int w_px, int h_px, const char *title)
 {
     NewWinReq *req = calloc(1, sizeof(*req));
@@ -240,11 +284,14 @@ static int _create_window_sync(int w_px, int h_px, const char *title)
     req->result_id = -1;
     req->sem = dispatch_semaphore_create(0);
 
+
     dispatch_async(dispatch_get_main_queue(), ^{
         _create_window_on_main(req);
     });
 
+
     dispatch_semaphore_wait(req->sem, DISPATCH_TIME_FOREVER);
+
     dispatch_release(req->sem);
 
     int id = req->result_id;
@@ -450,6 +497,8 @@ disconnect:
 
 int giza_server_worker_main(void)
 {
+    /* SIGPIPE を無視 — クライアント切断時にプロセスが死なないようにする */
+    signal(SIGPIPE, SIG_IGN);
     /* Remove stale socket */
     unlink(GS.sock_path);
 
@@ -481,6 +530,8 @@ int giza_server_worker_main(void)
 
     for (;;) {
         int cfd = accept(lfd, NULL, NULL);
+
+
         if (cfd < 0) {
             if (errno == EINTR) continue;
             perror("giza_server: accept");
