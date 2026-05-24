@@ -1,0 +1,108 @@
+--- /home/goosh/src/giza/v1.5.0-original/src/giza-drivers.c	2025-04-04 14:49:59.000000000 +0900
++++ /home/goosh/src/giza/v1.5.0-patched2/src/giza-drivers.c	2026-05-24 08:55:59.946242401 +0900
+@@ -25,6 +25,7 @@
+ #include "giza-private.h"
+ #include "giza-drivers-private.h"
+ #include "giza-driver-xw-private.h"
++#include "giza-driver-gs-private.h"
+ #include "giza-driver-png-private.h"
+ #include "giza-driver-mp4-private.h"
+ #include "giza-driver-pdf-private.h"
+@@ -199,6 +200,9 @@
+     case GIZA_DEVICE_XW:
+       success = _giza_open_device_xw (width, height, units);
+       break;
++    case GIZA_DEVICE_GS:
++      success = _giza_open_device_gs (width, height, units);
++      break;
+ #endif
+     case GIZA_DEVICE_MP4:
+     case GIZA_DEVICE_PNG:
+@@ -379,6 +383,9 @@
+        case GIZA_DEVICE_XW:
+          _giza_flush_device_xw ();
+          break;
++      case GIZA_DEVICE_GS:
++        _giza_flush_device_gs ();
++        break;
+ #endif
+        default:
+          if (!Dev[id].surface)
+@@ -449,6 +456,9 @@
+     case GIZA_DEVICE_XW:
+       _giza_change_page_xw ();
+       break;
++    case GIZA_DEVICE_GS:
++      _giza_change_page_gs ();
++      break;
+ #endif
+     case GIZA_DEVICE_MP4:
+     case GIZA_DEVICE_PNG:
+@@ -574,6 +584,9 @@
+     case GIZA_DEVICE_XW:
+       _giza_close_device_xw ();
+       break;
++    case GIZA_DEVICE_GS:
++      _giza_close_device_gs ();
++      break;
+ #endif
+     case GIZA_DEVICE_MP4:
+       _giza_close_device_mp4(1);
+@@ -903,12 +916,15 @@
+     newDevice = GIZA_DEVICE_NULL;
+ #ifdef _GIZA_HAS_XW
+   else if (!strcmp (devName, "/xw")
+-        || !strcmp (devName, "/xs")
+-        || !strcmp (devName, "/xserve")
++        /* /xs and /xserve are now handled by GIZA_DEVICE_GS below */
+         || !strcmp (devName, "/xwindow")
+         || !strcmp (devName, "/xwin"))
+     newDevice = GIZA_DEVICE_XW;
+ #endif
++  else if (!strcmp (devName, "/gs")
++        || !strcmp (devName, "/xs")
++        || !strcmp (devName, "/xserve"))
++    newDevice = GIZA_DEVICE_GS;
+   else if (!strcmp (devName, "/png"))
+     newDevice = GIZA_DEVICE_PNG;
+   else if (!strcmp(devName, "/mp4"))
+@@ -1081,6 +1097,9 @@
+     case GIZA_DEVICE_XW:
+       _giza_init_norm_xw ();
+       break;
++    case GIZA_DEVICE_GS:
++      _giza_init_norm_gs ();
++      break;
+ #endif
+     default:
+     /*
+--- /home/goosh/src/giza/v1.5.0-original/src/giza-drivers-private.h	2025-04-04 14:49:59.000000000 +0900
++++ /home/goosh/src/giza/v1.5.0-patched2/src/giza-drivers-private.h	2026-05-24 08:22:33.974501695 +0900
+@@ -33,6 +33,7 @@
+ #define GIZA_DEVICE_EPS    8
+ #define GIZA_DEVICE_SVG    9
+ #define GIZA_DEVICE_MP4    10
++#define GIZA_DEVICE_GS     30
+ 
+ #define GIZA_DEFAULT_PREFIX "giza"
+ 
+--- /home/goosh/src/giza/v1.5.0-original/src/Makefile.am	2025-04-04 14:49:59.000000000 +0900
++++ /home/goosh/src/giza/v1.5.0-patched2/src/Makefile.am	2026-05-24 08:40:34.328322210 +0900
+@@ -19,7 +19,7 @@
+        giza-cursor-routines.c giza-device-has-cursor.c \
+        giza-draw-background.c giza-draw.c giza-driver-eps.c \
+        giza-driver-null.c giza-driver-pdf.c giza-driver-png.c \
+-       giza-driver-mp4.c giza-driver-ps.c giza-driver-svg.c giza-driver-xw.c \
++       giza-driver-mp4.c giza-driver-ps.c giza-driver-svg.c giza-driver-xw.c giza-driver-gs.c \
+        giza-drivers.c giza-environment.c giza-error-bars.c giza-fill.c \
+        giza-format-number.c giza-function-t.c giza-function-x.c \
+        giza-function-y.c giza-get-key-press.c giza-get-surface-size.c \
+@@ -32,7 +32,7 @@
+        giza-transforms.c giza-vector.c giza-viewport.c giza-version.c \
+        giza-warnings.c giza-window.c giza.c lex.yy.c giza-itf.c\
+        giza-arrow-style-private.h giza-driver-svg-private.h giza-stroke-private.h \
+-       giza-band-private.h giza-driver-xw-private.h giza-subpanel-private.h \
++       giza-band-private.h giza-driver-xw-private.h giza-driver-gs-private.h giza-server-protocol.h giza-subpanel-private.h \
+        giza-character-size-private.h giza-drivers-private.h giza-text-background-private.h \
+        giza-colour-private.h giza-fill-private.h giza-text-private.h \
+        giza-cursor-private.h giza-io-private.h giza-tick-private.h giza-transforms-private.h \

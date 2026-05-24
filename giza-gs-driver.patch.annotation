@@ -1,0 +1,50 @@
+--- a/src/giza-drivers-private.h
++++ b/src/giza-drivers-private.h
+@@ -18,6 +18,7 @@
+ #define GIZA_DEVICE_MP4    10
+ #define GIZA_DEVICE_AQT    11
++#define GIZA_DEVICE_GS     12
+ #define GIZA_DEVICE_OSXCOCOA    20
+
+--- a/src/giza-drivers.c
++++ b/src/giza-drivers.c
+@@ -27,6 +27,7 @@
+ #include "giza-driver-xw-private.h"
++#include "giza-driver-gs-private.h"
+ #include "giza-transforms-private.h"
+
+@@ open_device @@
+-    case GIZA_DEVICE_XW:         /* /xs /xserve → still maps here via device_to_int */
++    /* /xs /xserve now handled by GIZA_DEVICE_GS, see _giza_device_to_int */
++    case GIZA_DEVICE_GS:
++      success = _giza_open_device_gs (width, height, units);
++      break;
+     case GIZA_DEVICE_OSXCOCOA:
+
+@@ flush_device @@
++      case GIZA_DEVICE_GS:
++        _giza_flush_device_gs ();
++        break;
+
+@@ change_page @@
++    case GIZA_DEVICE_GS:
++      _giza_change_page_gs ();
++      break;
+
+@@ close_device @@
++    case GIZA_DEVICE_GS:
++      _giza_close_device_gs ();
++      break;
+
+@@ init_norm @@
++    case GIZA_DEVICE_GS:
++      _giza_init_norm_gs ();
++      break;
+
+@@ _giza_device_to_int — remove /xs /xserve from XW, add GS block @@
+-        || !strcmp (devName, "/xs")
+-        || !strcmp (devName, "/xserve")
++    } else if (!strcmp (devName, "/gs")
++        || !strcmp (devName, "/xs")
++        || !strcmp (devName, "/xserve")) {
++    newDevice = GIZA_DEVICE_GS;

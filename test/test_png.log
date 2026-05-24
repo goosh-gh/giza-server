@@ -1,0 +1,15 @@
+INFO: reusing running giza_server (socket: /tmp/giza_server_1001.sock)
+INFO: sending PNG frame...
+test_png: connecting to /tmp/giza_server_1001.sock
+test_png: generated 8265-byte PNG
+PASS: PNG accepted (ACK received)
+      Window "giza-server test_png" should be visible on screen.
+
+================================================================
+  VISUAL CHECK: window 'giza-server test_png' should show
+  a red rectangle with a white cross.
+  Closing automatically in 5s ...
+  (set GIZA_TEST_DISPLAY_SECS=0 to skip the wait)
+================================================================
+PASS: test/test_png.sh
+PASS test/test_png.sh (exit status: 0)
