@@ -45,6 +45,7 @@
 #define GSP_MSG_PNG     0x10u  /* client → server: here is a PNG page  */
 #define GSP_MSG_TITLE   0x11u  /* client → server: window/tab title    */
 #define GSP_MSG_NEWWIN  0x12u  /* client → server: open a new window   */
+#define GSP_MSG_SLIDER  0x13u  /* server → client: slider value (float)*/
 #define GSP_MSG_CLOSE   0x20u  /* client → server: close this window   */
 #define GSP_MSG_ACK     0x21u  /* server → client: acknowledged        */
 #define GSP_MSG_ERR     0xFFu  /* server → client: error (+ message)   */

@@ -34,8 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-
 #include "giza-server-protocol.h"
+static void _slider_send(int win_id, float value);   /* fwd decl */
 
 /* ------------------------------------------------------------------ */
 /* GsView — custom NSView that letterbox-scales the current NSImage    */
@@ -45,8 +45,11 @@
 @public
     NSImage  *_image;   /* current plot frame          */
     NSLock   *_lock;
+    int       win_id;   /* ← which window this view belongs to        */
 }
 - (void)setImage:(NSImage *)img;
+- (void)sliderChanged:(NSSlider *)sender;
+
 @end
 
 
@@ -87,6 +90,7 @@
     if (self) {
         _lock  = [[NSLock alloc] init];
         _image = nil;
+        win_id = -1;
     }
     return self;
 }
@@ -100,6 +104,11 @@
     dispatch_async(dispatch_get_main_queue(), ^{
         [self setNeedsDisplay:YES];
     });
+}
+
+- (void)sliderChanged:(NSSlider *)sender
+{
+    _slider_send(self->win_id, (float)[sender doubleValue]);
 }
 
 - (void)drawRect:(NSRect)dirtyRect
@@ -152,6 +161,9 @@ typedef struct {
     GsView    *view;      /* retained — setImage: is thread-safe       */
     char       title[256];
     int        alive;
+    int        client_fd;         /* socket back to client (-1 if none) */
+    uint32_t   seq_out;           /* seq for SLIDER messages we send    */
+    pthread_mutex_t write_lock;   /* serialize writes to client_fd      */
 } GsWindow;
 
 /* ------------------------------------------------------------------ */
@@ -197,6 +209,7 @@ void giza_server_cocoa_init(void)
 
 typedef struct {
     int  suggested_w, suggested_h;
+    int  client_fd;
     char title[256];
     int  result_id;           /* filled in by main-thread block       */
     dispatch_semaphore_t sem;
@@ -219,8 +232,11 @@ static void _create_window_on_main(void *ptr)
 
     GsWindow *w = &GS.wins[idx];
     memset(w, 0, sizeof(*w));
-    w->id    = idx;
-    w->alive = 1;
+    w->id        = idx;
+    w->alive     = 1;
+    w->client_fd = req->client_fd;
+    w->seq_out   = 0;
+    pthread_mutex_init(&w->write_lock, NULL);
     strncpy(w->title,
             req->title[0] ? req->title : "giza",
             sizeof(w->title) - 1);
@@ -245,9 +261,30 @@ static void _create_window_on_main(void *ptr)
 
     [win setTitle:[NSString stringWithUTF8String:w->title]];
     [win setReleasedWhenClosed:NO];
-    GsView *view = [[GsView alloc] initWithFrame:win.contentView.bounds];
+
+    NSRect   cb       = win.contentView.bounds;
+    CGFloat  slider_h = 28.0;
+
+    /* GsView occupies everything ABOVE the slider strip */
+    NSRect view_frame = NSMakeRect(0, slider_h,
+                                   cb.size.width,
+                                   cb.size.height - slider_h);
+    GsView *view = [[GsView alloc] initWithFrame:view_frame];
+    view->win_id = idx;                         /* tell view its window */
     [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [win.contentView addSubview:view];
+
+    /* NSSlider strip along the bottom (origin bottom-left, isFlipped=NO) */
+    NSRect slider_frame = NSMakeRect(8, 4, cb.size.width - 16, slider_h - 8);
+    NSSlider *slider = [[NSSlider alloc] initWithFrame:slider_frame];
+    [slider setMinValue:0.5];
+    [slider setMaxValue:8.0];
+    [slider setDoubleValue:1.0];
+    [slider setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
+    [slider setContinuous:NO];                  /* 最小実証: 離したとき1発 */
+    [slider setTarget:view];
+    [slider setAction:@selector(sliderChanged:)];
+    [win.contentView addSubview:slider];
 
     w->window = win;
     w->view   = view;
@@ -275,11 +312,13 @@ static void _create_window_on_main(void *ptr)
 /* Synchronously create a window from a non-main thread               */
 
 
-static int _create_window_sync(int w_px, int h_px, const char *title)
+static int _create_window_sync(int w_px, int h_px, const char *title,
+                               int client_fd)
 {
     NewWinReq *req = calloc(1, sizeof(*req));
     req->suggested_w = w_px;
     req->suggested_h = h_px;
+    req->client_fd   = client_fd;
     strncpy(req->title, title ? title : "giza", sizeof(req->title) - 1);
     req->result_id = -1;
     req->sem = dispatch_semaphore_create(0);
@@ -387,6 +426,29 @@ static int _send_msg(int fd, uint8_t type, uint32_t seq,
     return 0;
 }
 
+static int _send_msg_locked(int win_id, int fd, uint8_t type, uint32_t seq,
+                            const void *payload, uint32_t plen)
+{
+    if (win_id >= 0 && win_id < GS.n_wins) {
+        pthread_mutex_lock(&GS.wins[win_id].write_lock);
+        int r = _send_msg(fd, type, seq, payload, plen);
+        pthread_mutex_unlock(&GS.wins[win_id].write_lock);
+        return r;
+    }
+    return _send_msg(fd, type, seq, payload, plen);   /* PONG 等、窓未確定 */
+}
+
+static void _slider_send(int win_id, float value)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive || w->client_fd < 0) return;
+    pthread_mutex_lock(&w->write_lock);
+    _send_msg(w->client_fd, GSP_MSG_SLIDER, w->seq_out++,
+              &value, sizeof(value));
+    pthread_mutex_unlock(&w->write_lock);
+}
+
 /* ------------------------------------------------------------------ */
 /* Per-connection thread                                               */
 /* ------------------------------------------------------------------ */
@@ -428,7 +490,7 @@ static void *_handle_connection(void *arg)
         switch (hdr.type) {
 
         case GSP_MSG_PING:
-            _send_msg(fd, GSP_MSG_PONG, seq_out++, NULL, 0);
+            _send_msg_locked(current_win, fd, GSP_MSG_PONG, seq_out++, NULL, 0);
             break;
 
         case GSP_MSG_NEWWIN: {
@@ -436,8 +498,9 @@ static void *_handle_connection(void *arg)
             if (payload && hdr.length >= sizeof(nw))
                 memcpy(&nw, payload, sizeof(nw));
             const char *ttl = title_buf[0] ? title_buf : "giza";
-            current_win = _create_window_sync(nw.width_px, nw.height_px, ttl);
-            _send_msg(fd, GSP_MSG_ACK, seq_out++, NULL, 0);
+            current_win = _create_window_sync(nw.width_px, nw.height_px,
+                                              ttl, fd);
+            _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
             break;
         }
 
@@ -461,19 +524,20 @@ static void *_handle_connection(void *arg)
 
 
         case GSP_MSG_PNG: {
+
             if (current_win < 0)
-                current_win = _create_window_sync(800, 600, "giza");
+                current_win = _create_window_sync(800, 600, "giza", fd);
             if (current_win >= 0) {
-                /* ownership of payload transferred to _update_window  */
                 _update_window(current_win, payload, hdr.length, title_buf);
                 payload = NULL;
             }
-            _send_msg(fd, GSP_MSG_ACK, seq_out++, NULL, 0);
+            _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
             break;
         }
 
+
         case GSP_MSG_CLOSE:
-            _send_msg(fd, GSP_MSG_ACK, seq_out++, NULL, 0);
+            _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
             free(payload);
             goto disconnect;
 
