@@ -1,0 +1,47 @@
+# --- autotools generated ---
+/Makefile
+/Makefile.in
+/aclocal.m4
+/autom4te.cache/
+/compile
+/config.guess
+/config.guess~
+/config.sub
+/config.sub~
+/config.h
+/config.h.in
+/config.log
+/config.status
+/configure
+/configure~
+/depcomp
+/install-sh
+/missing
+/stamp-h1
+/test-driver
+/test-suite.log
+*~
+
+# --- build products ---
+*.o
+.deps/
+.dirstamp
+/giza_server
+/test/test_ping
+/test/test_png
+/test/test_gs
+/test_gs.bin
+*.log
+*.trs
+
+# --- macOS / dev scratch ---
+*.debug
+*.old.*
+*.bak
+
+# --- work scratch (not for upstream) ---
+/download/
+/E2E_success.png
+/giza_server_integration_memo.md
+/gsp_client.pl
+/00_option_switches4configure.txt

@@ -1,6 +1,0 @@
-INFO: giza_server already running (socket: /tmp/giza_server_1001.sock)
-INFO: running ping/pong...
-test_ping: connecting to /tmp/giza_server_1001.sock
-PASS: ping/pong OK
-PASS: test/test_ping.sh
-PASS test/test_ping.sh (exit status: 0)
