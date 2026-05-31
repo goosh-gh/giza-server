@@ -20,6 +20,23 @@ The calling program opens the device `/GS`, renders frames as PNG into the serve
 via a lightweight binary protocol over a Unix-domain socket, and exits.  The server
 window stays open until the user closes it.
 
+### Client handshake (auto-launch)
+
+A client checks for a running server on the per-user socket
+(`/tmp/giza_server_$UID.sock`) and, if absent, forks and `exec`s the
+`giza_server` binary (detached via `setsid`), then polls until it is
+listening — exactly the handshake described in giza issue #85. Because the
+server outlives the client, plot windows persist after the calling program
+exits, just like `pgxwin_server`.
+
+### Verified end-to-end
+
+The server has been driven end-to-end on macOS (Apple Silicon, macOS 15)
+from `PDL::Graphics::Cairo`, which renders a figure to an in-memory PNG
+(`cairo_surface_write_to_png_stream`) and sends it over GSP with **no
+temporary files** on either side. Both the bundled `test/test_png` client
+and the Perl `Driver::GS` backend display correctly in native windows.
+
 ## Backends
 
 | Platform | Backend | Toolkit |
@@ -84,12 +101,22 @@ sudo make install
 
 ```bash
 # No extra dependencies — Cocoa.framework is part of macOS SDK
+# (cairo is required for the test client; install via MacPorts/Homebrew)
 
 # Build
 autoreconf -fi
 ./configure            # auto-detects Cocoa on macOS
 make
 sudo make install
+```
+
+**MacPorts note.** On a MacPorts system the default `gcc` may be picked up
+by `AC_PROG_OBJC` and lacks Objective-C/Cocoa support, and `pkg-config`
+lives under `/opt/local`. Use the Xcode `clang` and the MacPorts
+`pkg-config` explicitly:
+
+```bash
+./configure CC=clang OBJC=clang PKG_CONFIG=/opt/local/bin/pkg-config
 ```
 
 Force a specific backend:
