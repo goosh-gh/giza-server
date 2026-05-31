@@ -1,5 +1,5 @@
---- /home/goosh/src/giza/v1.5.0-original/src/giza-drivers.c	2025-04-04 14:49:59.000000000 +0900
-+++ /home/goosh/src/giza/v1.5.0-patched2/src/giza-drivers.c	2026-05-24 08:55:59.946242401 +0900
+--- a/src/giza-drivers.c	2025-04-04 14:49:59
++++ b/src/giza-drivers.c	2026-05-31 16:28:56
 @@ -25,6 +25,7 @@
  #include "giza-private.h"
  #include "giza-drivers-private.h"
@@ -8,47 +8,55 @@
  #include "giza-driver-png-private.h"
  #include "giza-driver-mp4-private.h"
  #include "giza-driver-pdf-private.h"
-@@ -199,6 +200,9 @@
+@@ -198,6 +199,11 @@
+ #ifdef _GIZA_HAS_XW
      case GIZA_DEVICE_XW:
        success = _giza_open_device_xw (width, height, units);
-       break;
++      break;
++#endif
++#ifdef _GIZA_HAS_GS
 +    case GIZA_DEVICE_GS:
 +      success = _giza_open_device_gs (width, height, units);
-+      break;
+       break;
  #endif
      case GIZA_DEVICE_MP4:
-     case GIZA_DEVICE_PNG:
-@@ -379,6 +383,9 @@
+@@ -379,6 +385,11 @@
         case GIZA_DEVICE_XW:
           _giza_flush_device_xw ();
           break;
++#endif
++#ifdef _GIZA_HAS_GS
 +      case GIZA_DEVICE_GS:
 +        _giza_flush_device_gs ();
 +        break;
  #endif
         default:
           if (!Dev[id].surface)
-@@ -449,6 +456,9 @@
-     case GIZA_DEVICE_XW:
+@@ -450,6 +461,11 @@
        _giza_change_page_xw ();
        break;
+ #endif
++#ifdef _GIZA_HAS_GS
 +    case GIZA_DEVICE_GS:
 +      _giza_change_page_gs ();
 +      break;
- #endif
++#endif
      case GIZA_DEVICE_MP4:
      case GIZA_DEVICE_PNG:
-@@ -574,6 +584,9 @@
-     case GIZA_DEVICE_XW:
+       _giza_change_page_png ();
+@@ -575,6 +591,11 @@
        _giza_close_device_xw ();
        break;
+ #endif
++#ifdef _GIZA_HAS_GS
 +    case GIZA_DEVICE_GS:
 +      _giza_close_device_gs ();
 +      break;
- #endif
++#endif
      case GIZA_DEVICE_MP4:
        _giza_close_device_mp4(1);
-@@ -903,12 +916,15 @@
+       break;
+@@ -903,12 +924,15 @@
      newDevice = GIZA_DEVICE_NULL;
  #ifdef _GIZA_HAS_XW
    else if (!strcmp (devName, "/xw")
@@ -66,18 +74,20 @@
    else if (!strcmp (devName, "/png"))
      newDevice = GIZA_DEVICE_PNG;
    else if (!strcmp(devName, "/mp4"))
-@@ -1081,6 +1097,9 @@
-     case GIZA_DEVICE_XW:
+@@ -1082,6 +1106,11 @@
        _giza_init_norm_xw ();
        break;
+ #endif
++#ifdef _GIZA_HAS_GS
 +    case GIZA_DEVICE_GS:
 +      _giza_init_norm_gs ();
 +      break;
- #endif
++#endif
      default:
      /*
---- /home/goosh/src/giza/v1.5.0-original/src/giza-drivers-private.h	2025-04-04 14:49:59.000000000 +0900
-+++ /home/goosh/src/giza/v1.5.0-patched2/src/giza-drivers-private.h	2026-05-24 08:22:33.974501695 +0900
+      * The cairo transformations are:
+--- a/src/giza-drivers-private.h	2025-04-04 14:49:59
++++ b/src/giza-drivers-private.h	2026-05-31 16:18:25
 @@ -33,6 +33,7 @@
  #define GIZA_DEVICE_EPS    8
  #define GIZA_DEVICE_SVG    9
@@ -86,8 +96,8 @@
  
  #define GIZA_DEFAULT_PREFIX "giza"
  
---- /home/goosh/src/giza/v1.5.0-original/src/Makefile.am	2025-04-04 14:49:59.000000000 +0900
-+++ /home/goosh/src/giza/v1.5.0-patched2/src/Makefile.am	2026-05-24 08:40:34.328322210 +0900
+--- a/src/Makefile.am	2025-04-04 14:49:59
++++ b/src/Makefile.am	2026-05-31 16:18:25
 @@ -19,7 +19,7 @@
         giza-cursor-routines.c giza-device-has-cursor.c \
         giza-draw-background.c giza-draw.c giza-driver-eps.c \
