@@ -177,16 +177,22 @@ _gs_connect_or_launch(void)
     int fd = _gs_try_connect();
     if (fd >= 0) return fd;
 
-    /* 2. Launch giza_server as a background daemon */
+    /* 2. Launch giza_server as a background daemon.
+     *    The binary is taken from $GIZA_SERVER if set, otherwise the
+     *    plain name "giza_server" is resolved via $PATH. */
+    const char *server_bin = getenv("GIZA_SERVER");
+    if (!server_bin || server_bin[0] == '\0')
+        server_bin = "giza_server";
+
     pid_t pid = fork();
     if (pid == 0) {
         setsid();
         int dn = open("/dev/null", O_RDWR);
         if (dn >= 0) { dup2(dn, STDIN_FILENO); dup2(dn, STDOUT_FILENO); close(dn); }
-        execlp("giza_server", "giza_server", (char *)NULL);
-        execlp("./giza_server", "giza_server", (char *)NULL);
+        execlp(server_bin, "giza_server", (char *)NULL);
         _exit(127);
     }
+
     if (pid < 0) {
         _giza_error("_giza_open_device_gs",
                     "fork() failed — cannot start giza_server");
