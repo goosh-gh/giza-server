@@ -50,6 +50,13 @@
 #define GSP_MSG_ACK     0x21u  /* server → client: acknowledged        */
 #define GSP_MSG_ERR     0xFFu  /* server → client: error (+ message)   */
 
+/* GSP_MSG_SLIDER payload:
+ *   uint8_t  slider_id   (which slider: 0=freq k, 1=amplitude A, ...)
+ *   float    value       (4 bytes, little-endian) — current slider value
+ *   server → client, fire-and-forget (no ACK).
+ *   Total payload: 5 bytes.
+ */
+
 /* ------------------------------------------------------------------ */
 /* Wire format                                                         */
 /* ------------------------------------------------------------------ */
@@ -95,6 +102,11 @@ typedef struct __attribute__((packed)) {
     uint32_t width_px;
     uint32_t height_px;
 } gsp_newwin_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  slider_id;
+    float    value;
+} gsp_slider_t;   /* 5 bytes */
 
 /* ------------------------------------------------------------------ */
 /* Timeouts & limits                                                   */

@@ -35,7 +35,7 @@
 #include <string.h>
 #include <errno.h>
 #include "giza-server-protocol.h"
-static void _slider_send(int win_id, float value);   /* fwd decl */
+static void _slider_send(int win_id, uint8_t slider_id, float value);
 
 /* ------------------------------------------------------------------ */
 /* GsView — custom NSView that letterbox-scales the current NSImage    */
@@ -49,7 +49,6 @@ static void _slider_send(int win_id, float value);   /* fwd decl */
 }
 - (void)setImage:(NSImage *)img;
 - (void)sliderChanged:(NSSlider *)sender;
-
 @end
 
 
@@ -76,9 +75,8 @@ static void _slider_send(int win_id, float value);   /* fwd decl */
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender
 {
     (void)sender;
-    return NSTerminateCancel;
+    return NSTerminateNow;
 }
-
 
 @end
 
@@ -108,7 +106,7 @@ static void _slider_send(int win_id, float value);   /* fwd decl */
 
 - (void)sliderChanged:(NSSlider *)sender
 {
-    _slider_send(self->win_id, (float)[sender doubleValue]);
+    _slider_send(self->win_id, (uint8_t)[sender tag], (float)[sender doubleValue]);
 }
 
 - (void)drawRect:(NSRect)dirtyRect
@@ -178,10 +176,43 @@ static struct {
     int         n_wins;
 } GS;
 
+
+/* ------------------------------------------------------------------ */
+/* Menu bar — App menu (Quit) + File menu (future: Save as PDF/SVG)    */
+/* ------------------------------------------------------------------ */
+
+static void _build_menu_bar(void)
+{
+    NSMenu *menubar = [[NSMenu alloc] init];
+    [NSApp setMainMenu:menubar];
+
+    /* --- アプリメニュー（先頭、アプリ名が出る所）--- */
+    NSMenuItem *app_item = [[NSMenuItem alloc] init];
+    [menubar addItem:app_item];
+    NSMenu *app_menu = [[NSMenu alloc] init];
+    [app_item setSubmenu:app_menu];
+
+    [app_menu addItemWithTitle:@"Quit giza_server"
+                        action:@selector(terminate:)
+                 keyEquivalent:@"q"];   /* ⌘Q が自動で効く */
+
+    /* --- File メニュー（今は空。将来 Save as PDF/SVG をここへ）--- */
+    NSMenuItem *file_item = [[NSMenuItem alloc] init];
+    [menubar addItem:file_item];
+    NSMenu *file_menu = [[NSMenu alloc] initWithTitle:@"File"];
+    [file_item setSubmenu:file_menu];
+    /* 将来:
+     * [file_menu addItemWithTitle:@"Save as PDF…"
+     *                      action:@selector(savePDF:) keyEquivalent:@"s"];
+     * [file_menu addItemWithTitle:@"Save as SVG…"
+     *                      action:@selector(saveSVG:) keyEquivalent:@""];
+     * (action は GsView 等に実装し、現在表示中の窓の中身を書き出す)
+     */
+}
+
 /* ------------------------------------------------------------------ */
 /* Public init — called from main thread before worker starts          */
 /* ------------------------------------------------------------------ */
-
 
 void giza_server_cocoa_init(void)
 {
@@ -198,6 +229,7 @@ void giza_server_cocoa_init(void)
 
     GsAppDelegate *delegate = [[GsAppDelegate alloc] init];
     [NSApp setDelegate:delegate];
+    _build_menu_bar();                  /* ← 追加 */
 
     /* finishLaunching は [NSApp run] が内部で呼ぶので明示しない */
 }
@@ -263,28 +295,50 @@ static void _create_window_on_main(void *ptr)
     [win setReleasedWhenClosed:NO];
 
     NSRect   cb       = win.contentView.bounds;
-    CGFloat  slider_h = 28.0;
+    CGFloat  slider_h = 28.0;   /* 横スライダの帯の高さ（下端） */
+    CGFloat  slider_w = 28.0;   /* 縦スライダの帯の幅（右端）   */
 
-    /* GsView occupies everything ABOVE the slider strip */
+    /* GsView は下と右を空けた領域 */
     NSRect view_frame = NSMakeRect(0, slider_h,
-                                   cb.size.width,
+                                   cb.size.width  - slider_w,
                                    cb.size.height - slider_h);
     GsView *view = [[GsView alloc] initWithFrame:view_frame];
-    view->win_id = idx;                         /* tell view its window */
+    view->win_id = idx;
     [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [win.contentView addSubview:view];
 
-    /* NSSlider strip along the bottom (origin bottom-left, isFlipped=NO) */
-    NSRect slider_frame = NSMakeRect(8, 4, cb.size.width - 16, slider_h - 8);
-    NSSlider *slider = [[NSSlider alloc] initWithFrame:slider_frame];
-    [slider setMinValue:0.5];
-    [slider setMaxValue:8.0];
-    [slider setDoubleValue:1.0];
-    [slider setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
-    [slider setContinuous:NO];                  /* 最小実証: 離したとき1発 */
-    [slider setTarget:view];
-    [slider setAction:@selector(sliderChanged:)];
-    [win.contentView addSubview:slider];
+    /* 横スライダ (tag=0, freq k): 下端、右端の縦スライダ分だけ手前で止める */
+    NSRect h_frame = NSMakeRect(8, 4,
+                                cb.size.width - slider_w - 16,
+                                slider_h - 8);
+    NSSlider *hslider = [[NSSlider alloc] initWithFrame:h_frame];
+    [hslider setMinValue:0.5];
+    [hslider setMaxValue:8.0];
+    [hslider setDoubleValue:1.0];
+    [hslider setTag:0];                         /* k */
+    [hslider setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
+    [hslider setContinuous:YES];
+    [hslider setTarget:view];
+    [hslider setAction:@selector(sliderChanged:)];
+    [win.contentView addSubview:hslider];
+
+    /* 縦スライダ (tag=1, amplitude A): 右端、幅<高さ で自動的に縦向き */
+    NSRect v_frame = NSMakeRect(cb.size.width - slider_w + 4, slider_h + 4,
+                                slider_w - 8,
+                                cb.size.height - slider_h - 8);
+    NSSlider *vslider = [[NSSlider alloc] initWithFrame:v_frame];
+    [vslider setMinValue:0.1];
+    [vslider setMaxValue:1.0];
+    [vslider setDoubleValue:1.0];
+    [vslider setTag:1];                          /* A */
+    [vslider setAutoresizingMask:NSViewMinXMargin | NSViewHeightSizable];
+    [vslider setContinuous:YES];
+    [vslider setTarget:view];
+    [vslider setAction:@selector(sliderChanged:)];
+    [win.contentView addSubview:vslider];
+
+
+
 
     w->window = win;
     w->view   = view;
@@ -438,14 +492,17 @@ static int _send_msg_locked(int win_id, int fd, uint8_t type, uint32_t seq,
     return _send_msg(fd, type, seq, payload, plen);   /* PONG 等、窓未確定 */
 }
 
-static void _slider_send(int win_id, float value)
+static void _slider_send(int win_id, uint8_t slider_id, float value)
 {
     if (win_id < 0 || win_id >= GS.n_wins) return;
     GsWindow *w = &GS.wins[win_id];
     if (!w->alive || w->client_fd < 0) return;
+    gsp_slider_t body;
+    body.slider_id = slider_id;
+    body.value     = value;
     pthread_mutex_lock(&w->write_lock);
     _send_msg(w->client_fd, GSP_MSG_SLIDER, w->seq_out++,
-              &value, sizeof(value));
+              &body, sizeof(body));
     pthread_mutex_unlock(&w->write_lock);
 }
 

@@ -37,6 +37,10 @@ from `PDL::Graphics::Cairo`, which renders a figure to an in-memory PNG
 temporary files** on either side. Both the bundled `test/test_png` client
 and the Perl `Driver::GS` backend display correctly in native windows.
 
+Bidirectional control is also verified on macOS: native sliders in the
+viewer send their values back to the client (server→client `SLIDER`), which
+recomputes the plot and pushes a new frame live — see **Examples** below.
+
 ## Backends
 
 | Platform | Backend | Toolkit |
@@ -67,7 +71,7 @@ You can override with `--with-viewer=gtk` or `--with-viewer=cocoa`.
 typedef struct {
     uint32_t magic;    /* 0x47495A41 "GIZA" */
     uint8_t  version;
-    uint8_t  type;     /* PNG, NEWWIN, CLOSE, PING/PONG, TITLE ... */
+    uint8_t  type;     /* PNG, NEWWIN, CLOSE, PING/PONG, TITLE, SLIDER ... */
     uint16_t flags;
     uint32_t length;   /* payload bytes */
     uint32_t seq;
@@ -81,6 +85,10 @@ typedef struct {
 | `PNG`   | client→server | ACK |
 | `TITLE` | client→server | **none** (fire-and-forget) |
 | `CLOSE` | client→server | ACK |
+| `SLIDER` | server→client | **none** (fire-and-forget) |
+
+`SLIDER` carries a 5-byte packed `gsp_slider_t` payload (`uint8_t` slider id
++ `float` value), letting one message type drive any number of sliders.
 
 ## Build
 
@@ -139,6 +147,32 @@ On macOS the Cocoa viewer does not need `DISPLAY`.
 On Linux the GTK viewer requires `DISPLAY` or `WAYLAND_DISPLAY`; tests are
 skipped (exit 77) in headless CI environments.
 
+## Examples
+
+`examples/client_slider.c` — a minimal **bidirectional** client that
+demonstrates server→client messaging (`GSP_MSG_SLIDER`). It is pure GSP +
+Cairo with **no libgiza**, deliberately isolating the bidirectional
+protocol from the device-driver layer.
+
+The viewer shows a sine wave with two native sliders — horizontal for
+frequency, vertical for amplitude. Dragging either one recomputes the wave
+on the client and pushes a new frame back to the window, live:
+
+```bash
+# build (cairo required; the relative include resolves ../viewer/protocol.h)
+clang examples/client_slider.c \
+  $(pkg-config --cflags --libs cairo) -o client_slider
+
+# run: start the server first, then the client
+./giza_server &
+./client_slider
+```
+
+Slider events are coalesced on the client (a non-blocking `MSG_DONTWAIT`
+peek drains the backlog, latest value wins), so fast dragging stays
+responsive even when redraws are heavy. Quit the viewer with ⌘Q or the
+**Quit** menu item.
+
 ## macOS Cocoa design notes
 
 The macOS backend (`viewer/giza-server-cocoa.m` + `viewer/giza-server-main.m`)
@@ -160,6 +194,19 @@ follows the same pattern as the giza `/osx` driver (PR #86):
 
 - `GSP_MSG_TITLE` is fire-and-forget on both backends — **no ACK**.
 
+- **Bidirectional sliders.** Native `NSSlider`s carry a `tag` used as the
+  slider id in the packed `gsp_slider_t` payload. The server→client `SLIDER`
+  write shares the client's socket fd with the connection's ACK path; since
+  ACK is written from the per-connection thread and `SLIDER` from the main
+  thread, every write to one fd is serialized through a per-window
+  `write_lock` (`_send_msg_locked`).
+
+- **Lifetime & quit.** The app stays alive after a client exits (the
+  `pgxwin_server` persistence role) via `disableAutomaticTermination`;
+  explicit quit (⌘Q or the **Quit** menu item) is honored because
+  `applicationShouldTerminate:` returns `NSTerminateNow`. A `File` menu is
+  present as a stub for future *Save as PDF / SVG*.
+
 ## Files
 
 ```
@@ -171,6 +218,8 @@ viewer/
 src/
   giza-driver-gs.c         — /gs device driver (add to libgiza)
   giza-driver-gs-private.h — driver header
+examples/
+  client_slider.c          — bidirectional slider demo (GSP + Cairo)
 patches/
   giza-v1.5.0-drivers.patch — patch for giza upstream
 ```
