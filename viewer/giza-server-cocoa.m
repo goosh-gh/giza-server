@@ -1,29 +1,59 @@
 /* viewer/giza-server-cocoa.m
  *
- * giza_server — macOS Cocoa backend
+ * giza_server - macOS Cocoa backend
  *
  * Replaces giza-server-gtk.c for macOS builds.  The GSP wire protocol
  * (giza-server-protocol.h) is 100% identical; only the windowing layer
  * changes.
  *
  * Architecture:
- *   main thread      — NSApp run loop (set up in giza-server-main.m)
- *   worker thread    — accept() loop, per-connection threads (POSIX)
- *   UI updates       — dispatch_async(dispatch_get_main_queue(), ^{})
+ *   main thread      - NSApp run loop (set up in giza-server-main.m)
+ *   worker thread    - accept() loop, per-connection threads (POSIX)
+ *   UI updates       - dispatch_async(dispatch_get_main_queue(), ^{})
  *                      (replaces GTK's g_idle_add)
  *
  * Key design choices (inherited from giza PR #86 experience):
- *   • NSApp MUST run on the main thread — enforced by giza-server-main.m
- *   • All NSWindow/NSView calls dispatched to main queue
- *   • PNG decoded to NSImage via NSData (no temp files)
- *   • Letterbox scaling in drawRect:  (same maths as GTK on_draw())
- *   • Window tabbing via NSWindowTabbingIdentifier (matches PDL::Graphics::Cairo)
- *   • Max 64 windows (matches GTK backend constant)
+ *   - NSApp MUST run on the main thread - enforced by giza-server-main.m
+ *   - All NSWindow/NSView calls dispatched to main queue
+ *   - PNG decoded to NSImage via NSData (no temp files)
+ *   - Letterbox scaling in drawRect:  (same maths as GTK on_draw())
+ *   - Window tabbing via NSWindowTabbingIdentifier (matches PDL::Graphics::Cairo)
+ *   - Max 64 windows (matches GTK backend constant)
  *
- * Copyright (c) 2026 goosh-gh — LGPL-2.1 (same as giza)
+ * Window lifecycle (persistence):
+ *   A window survives its client exiting (that is the whole point, like
+ *   pgxwin_server).  But the user closing a window (red button) IS an
+ *   explicit "discard": windowWillClose: marks the slot dead (alive=0),
+ *   nils window/view, frees last_png.  Slots are never compacted - the
+ *   array index is the win_id, so closed slots stay as holes and every
+ *   reader checks `alive`.
+ *
+ * File menu (Save):
+ *   - Save as PNG  - viewer-side, lossless (writes the received PNG bytes
+ *     kept in last_png).  Works for any client (C, Perl/Driver::GS).
+ *   - Save as PDF / SVG - vector output is not yet implemented; for now a
+ *     guidance dialog (alive client vs exited client).  True vector
+ *     (re-render on demand) is future work.
+ *   - All three items are auto-disabled (validateMenuItem:) when no live
+ *     giza window exists, so "selectable but silent" never happens.
+ *
+ * Reusable lessons (persistent-window GUI, apply if Driver::OSX /
+ * pdlcairo_viewer ever grows a Save dialog):
+ *   1. Close all three "gone" states separately: client exited, user
+ *      closed the window, and stale slot. Guard every reader with
+ *      alive + window/view identity, or freed objects get touched.
+ *   2. Never leave a menu item "selectable but silent" - use
+ *      validateMenuItem: to gray it out when the action is meaningless.
+ *   3. keyWindow can be nil; fall back keyWindow -> mainWindow ->
+ *      orderedWindows when resolving the front window.
+ *   4. UI work queued with dispatch_async may run after state changed,
+ *      so re-check liveness inside the block before using captured refs.
+ *
+ * Copyright (c) 2026 goosh-gh - LGPL-2.1 (same as giza)
  */
 
 #import <Cocoa/Cocoa.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -38,14 +68,14 @@
 static void _slider_send(int win_id, uint8_t slider_id, float value);
 
 /* ------------------------------------------------------------------ */
-/* GsView — custom NSView that letterbox-scales the current NSImage    */
+/* GsView - custom NSView that letterbox-scales the current NSImage    */
 /* ------------------------------------------------------------------ */
 
 @interface GsView : NSView {
 @public
     NSImage  *_image;   /* current plot frame          */
     NSLock   *_lock;
-    int       win_id;   /* ← which window this view belongs to        */
+    int       win_id;   /* which window this view belongs to          */
 }
 - (void)setImage:(NSImage *)img;
 - (void)sliderChanged:(NSSlider *)sender;
@@ -54,10 +84,10 @@ static void _slider_send(int win_id, uint8_t slider_id, float value);
 
 
 /* ------------------------------------------------------------------ */
-/* NSApplicationDelegate — AutomaticTermination 無効化                */
+/* NSApplicationDelegate (+ NSWindowDelegate) - termination & close   */
 /* ------------------------------------------------------------------ */
 
-@interface GsAppDelegate : NSObject <NSApplicationDelegate>
+@interface GsAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @end
 
 @implementation GsAppDelegate
@@ -77,6 +107,9 @@ static void _slider_send(int win_id, uint8_t slider_id, float value);
     (void)sender;
     return NSTerminateNow;
 }
+
+/* windowWillClose: / validateMenuItem: are implemented in the FileSave
+ * category below, where GsWindow / GS are finally in scope. */
 
 @end
 
@@ -155,13 +188,14 @@ static void _slider_send(int win_id, uint8_t slider_id, float value);
 
 typedef struct {
     int        id;
-    NSWindow  *window;    /* retained — only touch from main thread   */
-    GsView    *view;      /* retained — setImage: is thread-safe       */
+    NSWindow  *window;    /* retained - only touch from main thread   */
+    GsView    *view;      /* retained - setImage: is thread-safe       */
     char       title[256];
     int        alive;
     int        client_fd;         /* socket back to client (-1 if none) */
     uint32_t   seq_out;           /* seq for SLIDER messages we send    */
     pthread_mutex_t write_lock;   /* serialize writes to client_fd      */
+    NSData         *last_png;     /* latest page PNG (owned copy, for saving) */
 } GsWindow;
 
 /* ------------------------------------------------------------------ */
@@ -178,7 +212,208 @@ static struct {
 
 
 /* ------------------------------------------------------------------ */
-/* Menu bar — App menu (Quit) + File menu (future: Save as PDF/SVG)    */
+/* GsAppDelegate (FileSave) - File menu actions, validation, close     */
+/*                                                                     */
+/* Why here: GsAppDelegate's main @implementation sits near the top of    */
+/* the file, where GsWindow / GS are not yet declared. These methods      */
+/* reference both, so they are added as a category at this point, after   */
+/* both are defined.                                                      */
+/* ------------------------------------------------------------------ */
+
+@interface GsAppDelegate (FileSave)
+- (GsView *)_frontGsView;
+- (void)savePNG:(id)sender;
+- (void)savePDF:(id)sender;
+- (void)saveSVG:(id)sender;
+@end
+
+@implementation GsAppDelegate (FileSave)
+
+/* The window lays a GsView and the h/v sliders side by side directly
+ * under contentView, so contentView itself is not the GsView. Small
+ * helper that walks subviews to find it. */
+static GsView *_gsview_in(NSWindow *win)
+{
+    if (!win) return nil;
+    if ([[win contentView] isKindOfClass:[GsView class]])
+        return (GsView *)[win contentView];
+    for (NSView *v in [[win contentView] subviews])
+        if ([v isKindOfClass:[GsView class]]) return (GsView *)v;
+    return nil;
+}
+
+/* Is this GsView backed by a live GS.wins[] slot? Rejects windows the
+ * user closed via the red button (view already niled) and stale refs. */
+static BOOL _gsview_is_live(GsView *v)
+{
+    if (!v) return NO;
+    int id = v->win_id;
+    if (id < 0 || id >= GS.n_wins) return NO;
+    GsWindow *w = &GS.wins[id];
+    return (w->alive && w->view == v);
+}
+
+/* Return the frontmost LIVE GsView (nil if none).
+ * Falls back in stages so it works even when keyWindow is nil - e.g.
+ * right after the client died or a window closed and focus moved away;
+ * resolves the front-most still-open giza window. */
+- (GsView *)_frontGsView
+{
+    NSWindow *w = [NSApp keyWindow];
+    if (w) { GsView *v = _gsview_in(w); if (_gsview_is_live(v)) return v; }
+
+    w = [NSApp mainWindow];
+    if (w) { GsView *v = _gsview_in(w); if (_gsview_is_live(v)) return v; }
+
+    /* Front-to-back order. First live GsView wins. */
+    for (NSWindow *win in [NSApp orderedWindows]) {
+        if (![win isVisible]) continue;
+        GsView *v = _gsview_in(win);
+        if (_gsview_is_live(v)) return v;
+    }
+    return nil;
+}
+
+/* Menu item enable/disable. The three Save items are disabled (grayed
+ * out) when there is no live giza window to save. This prevents the
+ * "selectable but silent" trap - they gray out e.g. after all windows
+ * have been closed via the red button. */
+- (BOOL)validateMenuItem:(NSMenuItem *)item
+{
+    SEL a = [item action];
+    if (a == @selector(savePNG:) ||
+        a == @selector(savePDF:) ||
+        a == @selector(saveSVG:)) {
+        return ([self _frontGsView] != nil);
+    }
+    return YES;
+}
+
+/* File > Save as PNG: write the front window's latest PNG verbatim.
+ * We keep an owned copy of the received bytes, so it is lossless with
+ * no re-encoding. */
+- (void)savePNG:(id)sender
+{
+    (void)sender;
+
+    GsView *view = [self _frontGsView];
+    if (!view) { NSBeep(); return; }      /* no live giza window (normally grayed out) */
+
+    GsWindow *w   = &GS.wins[view->win_id];
+    NSData   *png = w->last_png;   /* on the main thread, no lock needed */
+    if (!png) { NSBeep(); return; }
+    /* MRC: the completionHandler below retains png automatically when the
+     * block is copied, so it stays safe even if the next frame replaces
+     * last_png while the save panel is open. */
+
+    NSString *base = (w->title[0])
+        ? [NSString stringWithUTF8String:w->title]
+        : @"giza_plot";
+    base = [base stringByReplacingOccurrencesOfString:@"/" withString:@"-"];
+
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    [panel setNameFieldStringValue:[base stringByAppendingPathExtension:@"png"]];
+    if (@available(macOS 11.0, *)) {
+        panel.allowedContentTypes = @[ UTTypePNG ];
+    }
+    /* macOS < 11: no extension filter (the default name already ends .png) */
+
+    NSWindow *key = [view window];
+    [panel beginSheetModalForWindow:key
+                  completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK) return;
+        NSURL   *url = [panel URL];
+        NSError *err = nil;
+        if (![png writeToURL:url options:NSDataWritingAtomic error:&err]) {
+            fprintf(stderr, "giza_server: PNG save failed: %s\n",
+                    err ? [[err localizedDescription] UTF8String] : "unknown");
+            NSBeep();
+        }
+    }];
+}
+
+/* Vector output (PDF/SVG) is not implemented yet (future work).
+ * Show one of two guidance dialogs depending on whether the client that
+ * drew this window is still alive:
+ *   client_fd >= 0 (alive)  -> "not yet supported" placeholder
+ *   client_fd <  0 (exited) -> tell the user to export from the program
+ * Messages are intentionally generic (no Perl-specific API names) since
+ * giza_server serves any client - C (xspec etc.) as well as Perl.        */
+- (void)_vectorSaveStub:(NSString *)fmt
+{
+    GsView *view = [self _frontGsView];
+    if (!view) { NSBeep(); return; }
+
+    GsWindow *w     = &GS.wins[view->win_id];
+    BOOL      alive = (w->client_fd >= 0);
+
+    NSAlert *alert = [[[NSAlert alloc] init] autorelease];
+    if (alive) {
+        [alert setMessageText:
+            [NSString stringWithFormat:@"%@ export not yet supported", fmt]];
+        [alert setInformativeText:
+            @"Vector output (PDF/SVG) is planned for a future release. "
+             "For now, use File \u2192 Save as PNG."];
+    } else {
+        [alert setMessageText:
+            [NSString stringWithFormat:@"Cannot save as %@", fmt]];
+        [alert setInformativeText:
+            @"The program that created this window has exited. To save "
+             "vector output, re-run it and export from the program itself "
+             "(for example, its native PDF/SVG/PostScript output device)."];
+    }
+    [alert addButtonWithTitle:@"OK"];
+
+    NSWindow *key = [view window];
+    if (key) {
+        /* MRC: the sheet block retains alert when copied; together with
+         * the autorelease above the retain count nets to zero. */
+        [alert beginSheetModalForWindow:key
+                      completionHandler:^(NSModalResponse r) { (void)r; }];
+    } else {
+        [alert runModal];
+    }
+}
+
+- (void)savePDF:(id)sender { (void)sender; [self _vectorSaveStub:@"PDF"]; }
+- (void)saveSVG:(id)sender { (void)sender; [self _vectorSaveStub:@"SVG"]; }
+
+/* ---- NSWindowDelegate ---- */
+/* Red-button close = explicit discard by the user. Logically invalidate
+ * the slot: alive=0 / window=nil / view=nil / free last_png / client_fd=-1.
+ * n_wins is NOT decremented (array index == win_id must stay stable, so
+ * closed slots remain as holes). Every reader (_update_window,
+ * _slider_send, the save actions) treats such a slot as "gone" by
+ * checking alive and the niled refs. */
+- (void)windowWillClose:(NSNotification *)note
+{
+    NSWindow *closing = [note object];
+
+    pthread_mutex_lock(&GS.wins_lock);
+    for (int i = 0; i < GS.n_wins; i++) {
+        GsWindow *w = &GS.wins[i];
+        if (!w->alive || w->window != closing) continue;
+
+        pthread_mutex_lock(&w->write_lock);
+        w->client_fd = -1;            /* stop reverse sends (discard even if alive) */
+        pthread_mutex_unlock(&w->write_lock);
+
+        w->alive  = 0;
+        w->window = nil;              /* MRC: setReleasedWhenClosed:NO, but */
+        w->view   = nil;              /*   nil it so save actions don't grab stale */
+        NSData *old = w->last_png;
+        w->last_png = nil;
+        [old release];
+        break;                        /* window is unique: one slot, done */
+    }
+    pthread_mutex_unlock(&GS.wins_lock);
+}
+
+@end
+
+
+/* ------------------------------------------------------------------ */
+/* Menu bar - App menu (Quit) + File menu (Save as PNG / PDF / SVG)    */
 /* ------------------------------------------------------------------ */
 
 static void _build_menu_bar(void)
@@ -186,7 +421,7 @@ static void _build_menu_bar(void)
     NSMenu *menubar = [[NSMenu alloc] init];
     [NSApp setMainMenu:menubar];
 
-    /* --- アプリメニュー（先頭、アプリ名が出る所）--- */
+    /* --- App menu (first item; shows the app name) --- */
     NSMenuItem *app_item = [[NSMenuItem alloc] init];
     [menubar addItem:app_item];
     NSMenu *app_menu = [[NSMenu alloc] init];
@@ -194,24 +429,31 @@ static void _build_menu_bar(void)
 
     [app_menu addItemWithTitle:@"Quit giza_server"
                         action:@selector(terminate:)
-                 keyEquivalent:@"q"];   /* ⌘Q が自動で効く */
+                 keyEquivalent:@"q"];   /* Cmd-Q works automatically */
 
-    /* --- File メニュー（今は空。将来 Save as PDF/SVG をここへ）--- */
+    /* --- File menu --- */
     NSMenuItem *file_item = [[NSMenuItem alloc] init];
     [menubar addItem:file_item];
     NSMenu *file_menu = [[NSMenu alloc] initWithTitle:@"File"];
     [file_item setSubmenu:file_menu];
-    /* 将来:
-     * [file_menu addItemWithTitle:@"Save as PDF…"
-     *                      action:@selector(savePDF:) keyEquivalent:@"s"];
-     * [file_menu addItemWithTitle:@"Save as SVG…"
-     *                      action:@selector(saveSVG:) keyEquivalent:@""];
-     * (action は GsView 等に実装し、現在表示中の窓の中身を書き出す)
-     */
+
+    /* target=nil: the action travels the responder chain to the matching
+     * method on [NSApp delegate]. Enable/disable is decided by that same
+     * delegate's validateMenuItem: (all three gray out when no live
+     * window exists). PNG is viewer-side; PDF/SVG show a guidance dialog. */
+    [file_menu addItemWithTitle:@"Save as PNG…"
+                         action:@selector(savePNG:)
+                  keyEquivalent:@"s"];   /* Cmd-S          */
+    [file_menu addItemWithTitle:@"Save as PDF…"
+                         action:@selector(savePDF:)
+                  keyEquivalent:@"S"];   /* Cmd-Shift-S (uppercase S = with Shift) */
+    [file_menu addItemWithTitle:@"Save as SVG…"
+                         action:@selector(saveSVG:)
+                  keyEquivalent:@""];    /* no shortcut */
 }
 
 /* ------------------------------------------------------------------ */
-/* Public init — called from main thread before worker starts          */
+/* Public init - called from main thread before worker starts          */
 /* ------------------------------------------------------------------ */
 
 void giza_server_cocoa_init(void)
@@ -229,14 +471,14 @@ void giza_server_cocoa_init(void)
 
     GsAppDelegate *delegate = [[GsAppDelegate alloc] init];
     [NSApp setDelegate:delegate];
-    _build_menu_bar();                  /* ← 追加 */
+    _build_menu_bar();
 
-    /* finishLaunching は [NSApp run] が内部で呼ぶので明示しない */
+    /* finishLaunching is called internally by [NSApp run]; not done here */
 }
 
 
 /* ------------------------------------------------------------------ */
-/* Window creation — must run on main thread                           */
+/* Window creation - must run on main thread                           */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -293,12 +535,15 @@ static void _create_window_on_main(void *ptr)
 
     [win setTitle:[NSString stringWithUTF8String:w->title]];
     [win setReleasedWhenClosed:NO];
+    /* Set a delegate so red-button closes are detected and the GS.wins[]
+     * slot is invalidated. The delegate is the same GsAppDelegate as NSApp's. */
+    [win setDelegate:(GsAppDelegate *)[NSApp delegate]];
 
     NSRect   cb       = win.contentView.bounds;
-    CGFloat  slider_h = 28.0;   /* 横スライダの帯の高さ（下端） */
-    CGFloat  slider_w = 28.0;   /* 縦スライダの帯の幅（右端）   */
+    CGFloat  slider_h = 28.0;   /* horizontal slider strip height (bottom) */
+    CGFloat  slider_w = 28.0;   /* vertical slider strip width (right)     */
 
-    /* GsView は下と右を空けた領域 */
+    /* GsView occupies the area minus the bottom and right strips */
     NSRect view_frame = NSMakeRect(0, slider_h,
                                    cb.size.width  - slider_w,
                                    cb.size.height - slider_h);
@@ -307,7 +552,7 @@ static void _create_window_on_main(void *ptr)
     [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [win.contentView addSubview:view];
 
-    /* 横スライダ (tag=0, freq k): 下端、右端の縦スライダ分だけ手前で止める */
+    /* Horizontal slider (tag=0, freq k): bottom, stops short of the right strip */
     NSRect h_frame = NSMakeRect(8, 4,
                                 cb.size.width - slider_w - 16,
                                 slider_h - 8);
@@ -322,7 +567,7 @@ static void _create_window_on_main(void *ptr)
     [hslider setAction:@selector(sliderChanged:)];
     [win.contentView addSubview:hslider];
 
-    /* 縦スライダ (tag=1, amplitude A): 右端、幅<高さ で自動的に縦向き */
+    /* Vertical slider (tag=1, amplitude A): right edge; width<height makes it vertical */
     NSRect v_frame = NSMakeRect(cb.size.width - slider_w + 4, slider_h + 4,
                                 slider_w - 8,
                                 cb.size.height - slider_h - 8);
@@ -354,7 +599,7 @@ static void _create_window_on_main(void *ptr)
 
 
 
-    /* Tab grouping — all giza_server windows share one tabbing ID */
+    /* Tab grouping - all giza_server windows share one tabbing ID */
 //   if (@available(macOS 10.12, *)) {
 //        win.tabbingIdentifier = @"giza_server_windows";
 //        win.tabbingMode       = NSWindowTabbingModePreferred;
@@ -393,7 +638,7 @@ static int _create_window_sync(int w_px, int h_px, const char *title,
 }
 
 /* ------------------------------------------------------------------ */
-/* PNG update — decode NSImage from memory, push to view               */
+/* PNG update - decode NSImage from memory, push to view               */
 /* ------------------------------------------------------------------ */
 
 static void _update_window(int win_id, const char *png_data, size_t png_len,
@@ -411,13 +656,22 @@ static void _update_window(int win_id, const char *png_data, size_t png_len,
 
     GsView   *view   = w->view;
     NSWindow *window = w->window;
+    GsWindow *wptr   = w;          /* to update last_png for saving */
 
-    /* 配列はブロックにキャプチャできないのでNSStringに変換してからretain */
+    /* The C array can't be captured by the block; convert to NSString and retain */
     NSString *ns_title = (title && title[0])
         ? [[NSString stringWithUTF8String:title] retain]
         : nil;
 
     dispatch_async(dispatch_get_main_queue(), ^{
+        /* Re-check on the main thread: windowWillClose: may have run in
+         * the meantime and invalidated the slot (red-button close). */
+        if (!wptr->alive || wptr->view != view) {
+            free(buf);
+            if (ns_title) [ns_title release];
+            return;
+        }
+
         NSData  *data = [NSData dataWithBytesNoCopy:buf
                                              length:png_len
                                        freeWhenDone:YES];
@@ -425,6 +679,16 @@ static void _update_window(int win_id, const char *png_data, size_t png_len,
         if (img) {
             [view setImage:img];
             [img release];
+
+            /* Keep an owned copy of the PNG bytes for saving. The `data`
+             * above is NoCopy(freeWhenDone:YES) and can't be kept. This is
+             * the main thread, serialized with savePNG:/windowWillClose:,
+             * so no lock is needed. */
+            NSData *keep = [[NSData alloc] initWithBytes:[data bytes]
+                                                 length:[data length]];
+            NSData *old = wptr->last_png;
+            wptr->last_png = keep;   /* alloc'd = +1 retain, no extra retain */
+            [old release];
         } else {
             fprintf(stderr, "giza_server: PNG decode failed\n");
         }
@@ -489,7 +753,7 @@ static int _send_msg_locked(int win_id, int fd, uint8_t type, uint32_t seq,
         pthread_mutex_unlock(&GS.wins[win_id].write_lock);
         return r;
     }
-    return _send_msg(fd, type, seq, payload, plen);   /* PONG 等、窓未確定 */
+    return _send_msg(fd, type, seq, payload, plen);   /* PONG etc.: no window yet */
 }
 
 static void _slider_send(int win_id, uint8_t slider_id, float value)
@@ -501,8 +765,12 @@ static void _slider_send(int win_id, uint8_t slider_id, float value)
     body.slider_id = slider_id;
     body.value     = value;
     pthread_mutex_lock(&w->write_lock);
-    _send_msg(w->client_fd, GSP_MSG_SLIDER, w->seq_out++,
-              &body, sizeof(body));
+    /* Re-check client_fd under write_lock: the disconnect teardown and
+     * windowWillClose: both flip it to -1 under the same lock, so we
+     * never grab a closed fd here. */
+    if (w->client_fd >= 0)
+        _send_msg(w->client_fd, GSP_MSG_SLIDER, w->seq_out++,
+                  &body, sizeof(body));
     pthread_mutex_unlock(&w->write_lock);
 }
 
@@ -568,7 +836,7 @@ static void *_handle_connection(void *arg)
                 size_t len = hdr.length < 255 ? hdr.length : 255;
                 memcpy(title_buf, payload, len);
                 title_buf[len] = '\0';
-                if (current_win >= 0) {
+                if (current_win >= 0 && GS.wins[current_win].alive) {
                     NSWindow *win = GS.wins[current_win].window;
                     NSString *ns  = [[NSString stringWithUTF8String:title_buf] retain];
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -608,17 +876,33 @@ static void *_handle_connection(void *arg)
     }
 
 disconnect:
+    /* Keep this client's windows (persistence) but invalidate client_fd.
+     * A single current_win would miss the "one connection, many windows"
+     * case, and after close() the fd number may be reused by another
+     * connection - so BEFORE close() we scan all windows by fd and reset
+     * them to -1. Writing under write_lock prevents the slider reverse
+     * send (_slider_send) from grabbing a closed fd. */
+    pthread_mutex_lock(&GS.wins_lock);
+    for (int i = 0; i < GS.n_wins; i++) {
+        if (GS.wins[i].client_fd == fd) {
+            pthread_mutex_lock(&GS.wins[i].write_lock);
+            GS.wins[i].client_fd = -1;
+            pthread_mutex_unlock(&GS.wins[i].write_lock);
+        }
+    }
+    pthread_mutex_unlock(&GS.wins_lock);
+
     close(fd);
     return NULL;
 }
 
 /* ------------------------------------------------------------------ */
-/* Accept loop — runs in worker thread                                 */
+/* Accept loop - runs in worker thread                                 */
 /* ------------------------------------------------------------------ */
 
 int giza_server_worker_main(void)
 {
-    /* SIGPIPE を無視 — クライアント切断時にプロセスが死なないようにする */
+    /* Ignore SIGPIPE so a client disconnect doesn't kill the process */
     signal(SIGPIPE, SIG_IGN);
     /* Remove stale socket */
     unlink(GS.sock_path);

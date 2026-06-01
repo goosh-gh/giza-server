@@ -31,17 +31,16 @@ endif
 # --- Cocoa backend (macOS) ---
 # Two .m files: the viewer logic and the main-thread bootstrapper.
 # Compiled as Objective-C; linked against Cocoa + pthread.
+
 if USE_COCOA
 giza_server_SOURCES = \
     viewer/giza-server-cocoa.m \
     viewer/giza-server-main.m \
     viewer/giza-server-protocol.h
-
 # -x objective-c is embedded in COCOA_CFLAGS from configure.ac
 giza_server_CFLAGS  = \
     -I$(srcdir)/viewer \
     $(COCOA_CFLAGS)
-
 giza_server_LDADD   = \
     $(COCOA_LIBS)
 endif
