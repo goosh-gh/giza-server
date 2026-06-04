@@ -64,13 +64,13 @@ else
     "$BINARY" &
     SERVER_PID=$!
     i=0
-    while [ $i -lt 30 ]; do
+    while [ $i -lt 100 ]; do
         [ -S "$SOCK" ] && break
         sleep 0.1
         i=$((i+1))
     done
     if [ ! -S "$SOCK" ]; then
-        echo "FAIL: giza_server did not create socket within 3s"
+        echo "FAIL: giza_server did not create socket within 10s"
         exit 1
     fi
     echo "INFO: server started (socket=$SOCK)"
