@@ -85,7 +85,10 @@ if test "$viewer_backend" = "cocoa"; then
                          [[NSApplication *a = [NSApplication sharedApplication]; (void)a;]])],
         [AC_MSG_RESULT([yes])
          COCOA_CFLAGS="-x objective-c"
-         COCOA_LIBS="-framework Cocoa -lpthread"],
+         dnl UniformTypeIdentifiers provides UTTypePNG/PDF/SVG used by the
+         dnl File>Save menu. Clang module auto-linking is not reliable here
+         dnl (depends on -fmodules), so link the framework explicitly.
+         COCOA_LIBS="-framework Cocoa -framework UniformTypeIdentifiers -lpthread"],
         [AC_MSG_RESULT([no])
          AC_MSG_ERROR([Cocoa framework not found. macOS SDK required.])])
     OBJCFLAGS="$save_OBJCFLAGS"
