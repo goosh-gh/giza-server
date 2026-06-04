@@ -67,7 +67,7 @@ which picks GTK on Linux and Cocoa on macOS).  Override with:
 ```
 ┌─────────────────────────────┐      Unix socket         ┌─────────────────────────┐
 │  Your program               │  ──────────────────────► │  giza-server            │
-│  (giza /GS driver)          │   GSP wire protocol      │  Linux:  GTK 3 viewer   │
+│  (giza /GS driver)          │   GSP wire protocol      │  Linux:  GTK 3 or Xlib viewer   │
 │                             │   PNG frames, titles,    │  macOS:  Cocoa viewer   │
 │  giza → Cairo PNG surface   │   NEWWIN / CLOSE msgs    │                         │
 └─────────────────────────────┘                          │  persistent window(s)   │
