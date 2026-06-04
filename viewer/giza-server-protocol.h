@@ -46,6 +46,8 @@
 #define GSP_MSG_TITLE   0x11u  /* client → server: window/tab title    */
 #define GSP_MSG_NEWWIN  0x12u  /* client → server: open a new window   */
 #define GSP_MSG_SLIDER  0x13u  /* server → client: slider value (float)*/
+#define GSP_MSG_SAVEREQ 0x14u  /* server → client: render & return vector (PDF/SVG) */
+#define GSP_MSG_SAVEDATA 0x15u /* client → server: vector bytes for a pending save   */
 #define GSP_MSG_CLOSE   0x20u  /* client → server: close this window   */
 #define GSP_MSG_ACK     0x21u  /* server → client: acknowledged        */
 #define GSP_MSG_ERR     0xFFu  /* server → client: error (+ message)   */
@@ -55,6 +57,26 @@
  *   float    value       (4 bytes, little-endian) — current slider value
  *   server → client, fire-and-forget (no ACK).
  *   Total payload: 5 bytes.
+ */
+
+/* Vector-save format codes (GSP_MSG_SAVEREQ / GSP_MSG_SAVEDATA payloads). */
+#define GSP_SAVE_FMT_PDF  0u
+#define GSP_SAVE_FMT_SVG  1u
+
+/* GSP_MSG_SAVEREQ payload:
+ *   uint8_t  fmt   (GSP_SAVE_FMT_PDF or GSP_SAVE_FMT_SVG)
+ *   server → client, fire-and-forget (no ACK).  Sent ONLY when the user
+ *   picks File > Save as PDF/SVG and the client is still alive.  The
+ *   client re-renders its current figure to that vector format and
+ *   replies with GSP_MSG_SAVEDATA.  Total payload: 1 byte.
+ *
+ * GSP_MSG_SAVEDATA payload:
+ *   uint8_t  fmt   (echoes the requested format, for a sanity check)
+ *   <vector bytes...>   (the rendered PDF or SVG document)
+ *   client → server, fire-and-forget (no ACK).  The server writes the
+ *   bytes to the path the user chose in the save panel.  The server
+ *   remembers (path, fmt) per window between SAVEREQ and SAVEDATA, so
+ *   the client never needs to know the destination path.
  */
 
 /* ------------------------------------------------------------------ */

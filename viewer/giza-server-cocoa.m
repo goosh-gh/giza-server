@@ -66,6 +66,7 @@
 #include <errno.h>
 #include "giza-server-protocol.h"
 static void _slider_send(int win_id, uint8_t slider_id, float value);
+static void _savereq_send(int win_id, uint8_t fmt);
 
 /* ------------------------------------------------------------------ */
 /* GsView - custom NSView that letterbox-scales the current NSImage    */
@@ -196,6 +197,8 @@ typedef struct {
     uint32_t   seq_out;           /* seq for SLIDER messages we send    */
     pthread_mutex_t write_lock;   /* serialize writes to client_fd      */
     NSData         *last_png;     /* latest page PNG (owned copy, for saving) */
+    char           *save_path;    /* pending vector-save destination (malloc'd, NULL if none) */
+    uint8_t         save_fmt;     /* GSP_SAVE_FMT_* for the pending save  */
 } GsWindow;
 
 /* ------------------------------------------------------------------ */
@@ -225,6 +228,8 @@ static struct {
 - (void)savePNG:(id)sender;
 - (void)savePDF:(id)sender;
 - (void)saveSVG:(id)sender;
+- (void)_vectorSave:(NSString *)fmt;
+- (void)_vectorSaveExited:(NSString *)fmt view:(GsView *)view;
 @end
 
 @implementation GsAppDelegate (FileSave)
@@ -332,42 +337,35 @@ static BOOL _gsview_is_live(GsView *v)
     }];
 }
 
-/* Vector output (PDF/SVG) is not implemented yet (future work).
- * Show one of two guidance dialogs depending on whether the client that
- * drew this window is still alive:
- *   client_fd >= 0 (alive)  -> "not yet supported" placeholder
- *   client_fd <  0 (exited) -> tell the user to export from the program
- * Messages are intentionally generic (no Perl-specific API names) since
- * giza_server serves any client - C (xspec etc.) as well as Perl.        */
-- (void)_vectorSaveStub:(NSString *)fmt
+/* File > Save as PDF/SVG.
+ *
+ * The viewer only ever holds a rasterised PNG (last_png), so true vector
+ * output cannot be produced viewer-side.  Instead we ask the still-running
+ * client to re-render its current figure to PDF/SVG and send the bytes
+ * back, mirroring the bidirectional SLIDER path:
+ *
+ *   1. user picks a destination in the save panel
+ *   2. we remember (save_path, save_fmt) on the window and send SAVEREQ(fmt)
+ *      to the client over its socket fd (serialized by write_lock)
+ *   3. the per-connection reader thread later receives SAVEDATA and writes
+ *      the bytes to save_path (see _save_vector_for_fd)
+ *
+ * If the client has already exited (client_fd < 0) there is nobody to
+ * re-render, so we fall back to the guidance dialog (_vectorSaveExited).  */
+- (void)_vectorSaveExited:(NSString *)fmt view:(GsView *)view
 {
-    GsView *view = [self _frontGsView];
-    if (!view) { NSBeep(); return; }
-
-    GsWindow *w     = &GS.wins[view->win_id];
-    BOOL      alive = (w->client_fd >= 0);
-
     NSAlert *alert = [[[NSAlert alloc] init] autorelease];
-    if (alive) {
-        [alert setMessageText:
-            [NSString stringWithFormat:@"%@ export not yet supported", fmt]];
-        [alert setInformativeText:
-            @"Vector output (PDF/SVG) is planned for a future release. "
-             "For now, use File \u2192 Save as PNG."];
-    } else {
-        [alert setMessageText:
-            [NSString stringWithFormat:@"Cannot save as %@", fmt]];
-        [alert setInformativeText:
-            @"The program that created this window has exited. To save "
-             "vector output, re-run it and export from the program itself "
-             "(for example, its native PDF/SVG/PostScript output device)."];
-    }
+    [alert setMessageText:
+        [NSString stringWithFormat:@"Cannot save as %@", fmt]];
+    [alert setInformativeText:
+        @"The program that created this window has exited, so it can no "
+         "longer re-render the plot. To save vector output, re-run it and "
+         "export from the program itself (for example, its native "
+         "PDF/SVG/PostScript output device), or use File \u2192 Save as PNG."];
     [alert addButtonWithTitle:@"OK"];
 
     NSWindow *key = [view window];
     if (key) {
-        /* MRC: the sheet block retains alert when copied; together with
-         * the autorelease above the retain count nets to zero. */
         [alert beginSheetModalForWindow:key
                       completionHandler:^(NSModalResponse r) { (void)r; }];
     } else {
@@ -375,8 +373,69 @@ static BOOL _gsview_is_live(GsView *v)
     }
 }
 
-- (void)savePDF:(id)sender { (void)sender; [self _vectorSaveStub:@"PDF"]; }
-- (void)saveSVG:(id)sender { (void)sender; [self _vectorSaveStub:@"SVG"]; }
+- (void)_vectorSave:(NSString *)fmt   /* @"PDF" or @"SVG" */
+{
+    GsView *view = [self _frontGsView];
+    if (!view) { NSBeep(); return; }
+
+    GsWindow *w     = &GS.wins[view->win_id];
+    BOOL      alive = (w->client_fd >= 0);
+    if (!alive) { [self _vectorSaveExited:fmt view:view]; return; }
+
+    /* Only one reverse-render save may be in flight per window: the
+     * reader thread clears save_path when SAVEDATA arrives. */
+    pthread_mutex_lock(&w->write_lock);
+    BOOL busy = (w->save_path != NULL);
+    pthread_mutex_unlock(&w->write_lock);
+    if (busy) {
+        NSBeep();   /* a save is already pending for this window */
+        return;
+    }
+
+    BOOL      is_svg = [fmt isEqualToString:@"SVG"];
+    uint8_t   code   = is_svg ? GSP_SAVE_FMT_SVG : GSP_SAVE_FMT_PDF;
+    NSString *ext    = is_svg ? @"svg" : @"pdf";
+
+    NSString *base = (w->title[0])
+        ? [NSString stringWithUTF8String:w->title]
+        : @"giza_plot";
+    base = [base stringByReplacingOccurrencesOfString:@"/" withString:@"-"];
+
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    [panel setNameFieldStringValue:[base stringByAppendingPathExtension:ext]];
+    if (@available(macOS 11.0, *)) {
+        panel.allowedContentTypes = @[ is_svg ? UTTypeSVG : UTTypePDF ];
+    }
+
+    int       win_id = view->win_id;
+    NSWindow *key    = [view window];
+    [panel beginSheetModalForWindow:key
+                  completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK) return;
+        const char *cpath = [[panel URL] fileSystemRepresentation];
+        if (!cpath) { NSBeep(); return; }
+
+        GsWindow *ww = &GS.wins[win_id];
+        pthread_mutex_lock(&ww->write_lock);
+        /* Re-check under the lock: the client may have died or the window
+         * closed while the panel was open (both nil client_fd to -1). */
+        if (!ww->alive || ww->client_fd < 0) {
+            pthread_mutex_unlock(&ww->write_lock);
+            NSBeep();
+            return;
+        }
+        free(ww->save_path);
+        ww->save_path = strdup(cpath);
+        ww->save_fmt  = code;
+        pthread_mutex_unlock(&ww->write_lock);
+
+        /* Ask the client to render & return the vector bytes. */
+        _savereq_send(win_id, code);
+    }];
+}
+
+- (void)savePDF:(id)sender { (void)sender; [self _vectorSave:@"PDF"]; }
+- (void)saveSVG:(id)sender { (void)sender; [self _vectorSave:@"SVG"]; }
 
 /* ---- NSWindowDelegate ---- */
 /* Red-button close = explicit discard by the user. Logically invalidate
@@ -396,6 +455,8 @@ static BOOL _gsview_is_live(GsView *v)
 
         pthread_mutex_lock(&w->write_lock);
         w->client_fd = -1;            /* stop reverse sends (discard even if alive) */
+        free(w->save_path);           /* drop any pending vector-save destination */
+        w->save_path = NULL;
         pthread_mutex_unlock(&w->write_lock);
 
         w->alive  = 0;
@@ -774,6 +835,79 @@ static void _slider_send(int win_id, uint8_t slider_id, float value)
     pthread_mutex_unlock(&w->write_lock);
 }
 
+/* Ask the live client of `win_id` to re-render its current figure to a
+ * vector format and send it back as GSP_MSG_SAVEDATA.  Same fd-sharing
+ * discipline as _slider_send: the SAVEREQ write is serialized with the
+ * ACK path through the per-window write_lock. */
+static void _savereq_send(int win_id, uint8_t fmt)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive) return;
+    pthread_mutex_lock(&w->write_lock);
+    if (w->client_fd >= 0)
+        _send_msg(w->client_fd, GSP_MSG_SAVEREQ, w->seq_out++, &fmt, 1);
+    pthread_mutex_unlock(&w->write_lock);
+}
+
+/* Handle GSP_MSG_SAVEDATA from a client: find the window on this fd that
+ * has a pending save (save_path set by the main thread in _vectorSave:)
+ * and write the vector bytes to it.  Called from the per-connection
+ * reader thread.  payload = [uint8 fmt][vector bytes...]. */
+static void _save_vector_for_fd(int fd, const char *payload, size_t plen)
+{
+    if (plen < 1) {
+        fprintf(stderr, "giza_server: SAVEDATA too short\n");
+        return;
+    }
+    uint8_t      fmt   = (uint8_t)payload[0];
+    const char  *bytes = payload + 1;
+    size_t       blen  = plen - 1;
+
+    /* Steal the destination path under the locks, then write outside them
+     * (file I/O must not be held under write_lock). */
+    char   *path   = NULL;
+    uint8_t want   = 0;
+    pthread_mutex_lock(&GS.wins_lock);
+    for (int i = 0; i < GS.n_wins; i++) {
+        GsWindow *w = &GS.wins[i];
+        if (w->client_fd != fd) continue;
+        pthread_mutex_lock(&w->write_lock);
+        if (w->save_path) {
+            path = w->save_path;       /* take ownership */
+            want = w->save_fmt;
+            w->save_path = NULL;
+        }
+        pthread_mutex_unlock(&w->write_lock);
+        if (path) break;
+    }
+    pthread_mutex_unlock(&GS.wins_lock);
+
+    if (!path) {
+        fprintf(stderr, "giza_server: SAVEDATA with no pending save (ignored)\n");
+        return;
+    }
+    if (fmt != want)
+        fprintf(stderr, "giza_server: SAVEDATA format mismatch "
+                "(got %u, expected %u) - writing anyway\n", fmt, want);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "giza_server: cannot open %s: %s\n",
+                path, strerror(errno));
+        free(path);
+        dispatch_async(dispatch_get_main_queue(), ^{ NSBeep(); });
+        return;
+    }
+    size_t wrote = blen ? fwrite(bytes, 1, blen, f) : 0;
+    fclose(f);
+    if (wrote != blen) {
+        fprintf(stderr, "giza_server: short write to %s\n", path);
+        dispatch_async(dispatch_get_main_queue(), ^{ NSBeep(); });
+    }
+    free(path);
+}
+
 /* ------------------------------------------------------------------ */
 /* Per-connection thread                                               */
 /* ------------------------------------------------------------------ */
@@ -866,6 +1000,12 @@ static void *_handle_connection(void *arg)
             free(payload);
             goto disconnect;
 
+        case GSP_MSG_SAVEDATA:
+            /* client replied to a SAVEREQ: write the vector bytes to the
+             * path the user chose.  fire-and-forget (no ACK). */
+            _save_vector_for_fd(fd, payload, hdr.length);
+            break;
+
         default:
             fprintf(stderr, "giza_server: unknown msg type 0x%02X\n",
                     hdr.type);
@@ -887,6 +1027,8 @@ disconnect:
         if (GS.wins[i].client_fd == fd) {
             pthread_mutex_lock(&GS.wins[i].write_lock);
             GS.wins[i].client_fd = -1;
+            free(GS.wins[i].save_path);   /* drop any pending vector-save */
+            GS.wins[i].save_path = NULL;
             pthread_mutex_unlock(&GS.wins[i].write_lock);
         }
     }

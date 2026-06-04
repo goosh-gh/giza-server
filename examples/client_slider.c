@@ -1,6 +1,8 @@
 /* client_slider.c — minimal bidirectional GSP client.
  * Sends sin(k*x); receives SLIDER from server; redraws. No libgiza. */
 #include <cairo/cairo.h>
+#include <cairo/cairo-pdf.h>
+#include <cairo/cairo-svg.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,21 +76,90 @@ static int apply_slider(uint32_t plen, double *k, double *amp){
     return 0;   /* 未知のスライダid は無視 */
 }
 
-static int render_and_send(double k, double amp){
-    cairo_surface_t *s=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,W,H);
-    cairo_t *cr=cairo_create(s);
+/* 共有の描画ロジック（PNG送信とベクタ保存の両方から呼ぶ）*/
+static void draw_plot(cairo_t *cr, double k, double amp){
     cairo_set_source_rgb(cr,1,1,1); cairo_paint(cr);
     cairo_set_source_rgb(cr,0.8,0.8,0.8); cairo_set_line_width(cr,1);
     cairo_move_to(cr,0,H/2.0); cairo_line_to(cr,W,H/2.0); cairo_stroke(cr);
     cairo_set_source_rgb(cr,0.1,0.3,0.9); cairo_set_line_width(cr,2);
     for(int i=0;i<W;i++){
-/*         double x=(double)i/W*10.0, y=sin(k*x); */
-        double x=(double)i/W*10.0, y=amp*sin(k*x);   /* ← amp を掛ける */
-
+        double x=(double)i/W*10.0, y=amp*sin(k*x);
         double py=H/2.0 - y*(H/2.0-40);
         if(i==0) cairo_move_to(cr,i,py); else cairo_line_to(cr,i,py);
     }
-    cairo_stroke(cr); cairo_destroy(cr); cairo_surface_flush(s);
+    cairo_stroke(cr);
+}
+
+static int render_and_send(double k, double amp);   /* fwd */
+
+/* SAVEREQ への応答: 現在の k/amp を PDF/SVG に描いて SAVEDATA で返送。
+ * Cairo の Pdf/SvgSurface はパス必須なので tmp ファイル経由。 */
+static int save_vector(uint8_t fmt, double k, double amp){
+    /* Honor $TMPDIR (set per-user on macOS as /var/folders/.../T/),
+     * falling back to /tmp on systems that leave it unset (Linux).
+     * Mirrors Perl File::Spec->tmpdir used by Driver::GS. */
+    const char *td = getenv("TMPDIR");
+    if (!td || !*td) td = "/tmp";
+    size_t tl = strlen(td);
+    char tmpl[512];
+    snprintf(tmpl, sizeof(tmpl), "%s%sgiza_gs_save_XXXXXX",
+             td, (tl && td[tl-1] == '/') ? "" : "/");
+    int tfd=mkstemp(tmpl);
+    if(tfd<0){ perror("mkstemp"); return 0; }   /* 失敗しても接続は継続 */
+    close(tfd);                                  /* Cairo がパスで書く */
+
+    cairo_surface_t *s = (fmt==GSP_SAVE_FMT_SVG)
+        ? cairo_svg_surface_create(tmpl, W, H)
+        : cairo_pdf_surface_create(tmpl, W, H);
+    cairo_t *cr=cairo_create(s);
+    draw_plot(cr,k,amp);
+    cairo_destroy(cr);
+    cairo_surface_finish(s);                     /* ファイル確定 */
+    cairo_surface_destroy(s);
+
+    /* slurp */
+    FILE *f=fopen(tmpl,"rb");
+    if(!f){ unlink(tmpl); return 0; }
+    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+    if(n<0){ fclose(f); unlink(tmpl); return 0; }
+    /* payload = [uint8 fmt][vector bytes] */
+    char *buf=malloc(1+(size_t)n);
+    if(!buf){ fclose(f); unlink(tmpl); return 0; }
+    buf[0]=(char)fmt;
+    size_t got = n ? fread(buf+1,1,(size_t)n,f) : 0;
+    fclose(f); unlink(tmpl);
+
+    int rc=send_msg(GSP_MSG_SAVEDATA, buf, (uint32_t)(1+got));
+    free(buf);
+    return rc;   /* 0=ok, -1=write error */
+}
+
+/* PNG送信後の ACK 待ち。待つ間に割り込む SAVEREQ は取りこぼさず処理し、
+ * SLIDER 等はドレインして ACK が来るまで待ち続ける。 */
+static int recv_ack_x(double k, double amp){
+    for(;;){
+        gsp_header_t h;
+        if(readn(g_fd,&h,sizeof(h))<0) return -1;
+        if(h.magic!=GSP_MAGIC){ fprintf(stderr,"bad magic\n"); return -1; }
+        if(h.type==GSP_MSG_ACK) return drain(h.length);
+        if(h.type==GSP_MSG_SAVEREQ){
+            uint8_t fmt=GSP_SAVE_FMT_PDF;
+            if(h.length>=1){
+                if(readn(g_fd,&fmt,1)<0) return -1;
+                if(drain(h.length-1)<0) return -1;
+            }
+            if(save_vector(fmt,k,amp)<0) return -1;
+            continue;                            /* まだ ACK を待つ */
+        }
+        if(drain(h.length)<0) return -1;         /* SLIDER 等: 吸って継続 */
+    }
+}
+
+static int render_and_send(double k, double amp){
+    cairo_surface_t *s=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,W,H);
+    cairo_t *cr=cairo_create(s);
+    draw_plot(cr,k,amp);
+    cairo_destroy(cr); cairo_surface_flush(s);
 
     PngBuf pb={0}; pb.cap=64*1024; pb.buf=malloc(pb.cap);
     cairo_surface_write_to_png_stream(s,png_w,&pb);
@@ -96,7 +167,7 @@ static int render_and_send(double k, double amp){
     int rc=send_msg(GSP_MSG_PNG, pb.buf, (uint32_t)pb.len);
     free(pb.buf);
     if(rc<0) return -1;
-    return recv_ack();
+    return recv_ack_x(k,amp);
 }
 
 int main(void){
@@ -128,6 +199,13 @@ for(;;){
             int r = apply_slider(h.length, &k, &amp);
             if(r<0) break;
             if(r>0) changed = 1;
+        } else if(h.type==GSP_MSG_SAVEREQ){
+            uint8_t fmt=GSP_SAVE_FMT_PDF;
+            if(h.length>=1){
+                if(readn(g_fd,&fmt,1)<0) break;
+                if(h.length>1 && drain(h.length-1)<0) break;
+            }
+            if(save_vector(fmt,k,amp)<0) break;
         } else {
             if(drain(h.length)<0) break;
         }
@@ -142,6 +220,13 @@ for(;;){
                 int r = apply_slider(h2.length, &k, &amp);
                 if(r<0) goto done;
                 if(r>0) changed = 1;
+            } else if(h2.type==GSP_MSG_SAVEREQ){
+                uint8_t fmt=GSP_SAVE_FMT_PDF;
+                if(h2.length>=1){
+                    if(readn(g_fd,&fmt,1)<0) goto done;
+                    if(h2.length>1 && drain(h2.length-1)<0) goto done;
+                }
+                if(save_vector(fmt,k,amp)<0) goto done;
             } else {
                 if(drain(h2.length)<0) goto done;
             }
