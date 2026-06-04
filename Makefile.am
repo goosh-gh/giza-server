@@ -28,6 +28,26 @@ giza_server_LDADD   = \
     $(PTHREAD_LIBS)
 endif
 
+# --- Xlib backend (Linux, X11 only — no GTK/GLib/GIO required) ---
+# Depends only on libX11, cairo, cairo-xlib, libpng, and libpthread.
+# Build with:  ./configure --with-viewer=xlib
+# Verify afterwards:  ldd giza_server | grep -i gtk   (should be empty)
+
+if USE_XLIB
+giza_server_SOURCES = \
+    viewer/giza-server-xlib.c \
+    viewer/giza-server-protocol.h
+
+giza_server_CFLAGS  = \
+    -I$(srcdir)/viewer \
+    $(XLIB_CFLAGS)
+
+giza_server_LDADD   = \
+    $(XLIB_LIBS) \
+    -lpng \
+    $(PTHREAD_LIBS)
+endif
+
 # --- Cocoa backend (macOS) ---
 # Two .m files: the viewer logic and the main-thread bootstrapper.
 # Compiled as Objective-C; linked against Cocoa + pthread.
@@ -73,6 +93,7 @@ SH_LOG_COMPILER = sh
 # ------------------------------------------------------------------ #
 
 EXTRA_DIST = \
+    viewer/giza-server-xlib.c \
     src/giza-driver-gs.c \
     src/giza-driver-gs-private.h \
     patches/giza-v1.5.0-drivers.patch \

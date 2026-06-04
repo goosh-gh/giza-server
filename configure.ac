@@ -30,8 +30,8 @@ esac
 
 dnl --- Viewer backend selection ---
 AC_ARG_WITH([viewer],
-    [AS_HELP_STRING([--with-viewer=gtk|cocoa|auto],
-        [windowing backend: gtk (Linux), cocoa (macOS), auto (default)])],
+    [AS_HELP_STRING([--with-viewer=gtk|xlib|cocoa|auto],
+        [windowing backend: gtk (Linux, GTK3), xlib (Linux, X11 only), cocoa (macOS), auto (default)])],
     [viewer_backend="$withval"],
     [viewer_backend="auto"])
 
@@ -46,20 +46,24 @@ fi
 
 dnl Validate choice
 case "$viewer_backend" in
-    gtk|cocoa) ;;
+    gtk|xlib|cocoa) ;;
     *)
-        AC_MSG_ERROR([--with-viewer must be gtk, cocoa, or auto (got: $viewer_backend)])
+        AC_MSG_ERROR([--with-viewer must be gtk, xlib, cocoa, or auto (got: $viewer_backend)])
         ;;
 esac
 
 AM_CONDITIONAL([USE_COCOA], [test "$viewer_backend" = "cocoa"])
 AM_CONDITIONAL([USE_GTK],   [test "$viewer_backend" = "gtk"])
+AM_CONDITIONAL([USE_XLIB],  [test "$viewer_backend" = "xlib"])
 
 dnl --- pthread ---
 AC_CHECK_LIB([pthread], [pthread_create],
     [PTHREAD_LIBS="-lpthread"],
     [AC_MSG_ERROR([libpthread not found.])])
 AC_SUBST([PTHREAD_LIBS])
+
+dnl --- pkg-config (required for all backends) ---
+PKG_PROG_PKG_CONFIG
 
 dnl --- GTK backend libraries ---
 if test "$viewer_backend" = "gtk"; then
@@ -68,6 +72,15 @@ if test "$viewer_backend" = "gtk"; then
         [],
         [AC_MSG_ERROR([gtk+-3.0, gio-unix-2.0, and cairo are required.
   Ubuntu/Debian:  sudo apt install libgtk-3-dev libcairo2-dev])])
+fi
+
+dnl --- Xlib backend libraries (X11 + cairo-xlib only; no GTK/GLib) ---
+if test "$viewer_backend" = "xlib"; then
+    AC_CONFIG_SRCDIR([viewer/giza-server-xlib.c])
+    PKG_CHECK_MODULES([XLIB], [x11 cairo cairo-xlib],
+        [],
+        [AC_MSG_ERROR([x11, cairo, and cairo-xlib are required for the xlib backend.
+  Ubuntu/Debian:  sudo apt install libx11-dev libcairo2-dev])])
 fi
 
 dnl --- Cocoa backend: no pkg-config needed (system frameworks) ---

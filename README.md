@@ -12,7 +12,7 @@ In PGPLOT, `pgxwin_server` kept plot windows alive after the calling program exi
 |---------|--------------|-------------|
 | Rendering | X11 Pixmap | Cairo (publication quality) |
 | IPC | X atoms + shared memory | Unix-domain socket |
-| GUI toolkit | Xlib/Xt | GTK 3 (Linux) / Cocoa (macOS) |
+| GUI toolkit | Xlib/Xt | GTK 3 or Xlib (Linux) / Cocoa (macOS) |
 | WSL2 / Wayland | No | Yes (no X atoms needed) |
 | macOS native | No | Yes (NSWindow/NSView, v0.2+) |
 
@@ -43,13 +43,24 @@ recomputes the plot and pushes a new frame live — see **Examples** below.
 
 ## Backends
 
-| Platform | Backend | Toolkit |
-|----------|---------|---------|
-| Linux / WSL2 | GTK 3 + Cairo | `libgtk-3-dev` |
+The viewer is a **standalone binary** (`giza_server`) separate from the `/gs`
+driver inside libgiza.  The backend is selected at *configure* time and has no
+effect on the protocol or the driver.
+
+| Platform | Backend | Dependencies |
+|----------|---------|--------------|
+| Linux / WSL2 | GTK 3 + Cairo | `libgtk-3-dev libcairo2-dev` |
+| Linux / WSL2 | **Xlib + Cairo** (no GTK/GLib) | `libx11-dev libcairo2-dev` |
 | macOS (Apple Silicon / x86_64) | Cocoa (NSWindow) | system Cocoa.framework |
 
-The backend is detected automatically at configure time (`--with-viewer=auto`).
-You can override with `--with-viewer=gtk` or `--with-viewer=cocoa`.
+The backend is detected automatically at configure time (`--with-viewer=auto`,
+which picks GTK on Linux and Cocoa on macOS).  Override with:
+
+```bash
+./configure --with-viewer=gtk      # GTK 3 (Linux, default)
+./configure --with-viewer=xlib     # Xlib only — no GTK/GLib/GIO required
+./configure --with-viewer=cocoa    # macOS Cocoa
+```
 
 ## Architecture
 
@@ -92,7 +103,7 @@ typedef struct {
 
 ## Build
 
-### Linux (GTK 3)
+### Linux — GTK 3 (default)
 
 ```bash
 # Prerequisites
@@ -102,6 +113,28 @@ sudo apt install libgtk-3-dev libcairo2-dev
 autoreconf -fi
 ./configure            # auto-detects GTK on Linux
 make
+sudo make install
+```
+
+### Linux — Xlib only (no GTK/GLib required)
+
+For minimal-dependency systems, CI containers, or HPC clusters where GTK 3 is
+unavailable, build the Xlib backend instead.  It links only against
+`libX11`, `cairo`, `cairo-xlib`, `libpng`, and `libpthread` — all standard
+X11 system libraries.
+
+```bash
+# Prerequisites (subset of the GTK build)
+sudo apt install libx11-dev libcairo2-dev
+
+# Build
+autoreconf -fi
+./configure --with-viewer=xlib
+make
+
+# Verify no GTK/GLib linkage
+ldd giza_server | grep -i gtk   # should be empty
+
 sudo make install
 ```
 
@@ -130,8 +163,9 @@ lives under `/opt/local`. Use the Xcode `clang` and the MacPorts
 Force a specific backend:
 
 ```bash
+./configure --with-viewer=gtk      # GTK 3 (Linux, default)
+./configure --with-viewer=xlib     # Xlib only (Linux)
 ./configure --with-viewer=cocoa    # macOS Cocoa
-./configure --with-viewer=gtk      # GTK 3 (Linux)
 ```
 
 ## Test
@@ -212,7 +246,8 @@ follows the same pattern as the giza `/osx` driver (PR #86):
 ```
 viewer/
   giza-server-protocol.h   — GSP wire format (shared by driver + viewer)
-  giza-server-gtk.c        — GTK 3 viewer (Linux)
+  giza-server-gtk.c        — GTK 3 viewer (Linux, default)
+  giza-server-xlib.c       — Xlib viewer (Linux, no GTK/GLib)
   giza-server-cocoa.m      — Cocoa viewer (macOS)
   giza-server-main.m       — macOS main-thread bootstrapper
 src/
