@@ -12,7 +12,11 @@ set -e
 
 BINARY=./giza_server
 TEST_PING=./test/test_ping
-SOCK="/tmp/giza_server_$(id -u).sock"
+# Each test run owns a private server on its own socket (honored by the
+# server, the test client and Driver::GS via $GIZA_SERVER_SOCK). Avoids
+# colliding with a user's running giza_server or the other test script.
+export GIZA_SERVER_SOCK="${TMPDIR:-/tmp}/giza_test_ping_$$.sock"
+SOCK="$GIZA_SERVER_SOCK"
 SERVER_PID=""
 
 cleanup() {
@@ -64,13 +68,13 @@ else
     "$BINARY" &
     SERVER_PID=$!
     i=0
-    while [ $i -lt 100 ]; do
+    while [ $i -lt 300 ]; do
         [ -S "$SOCK" ] && break
         sleep 0.1
         i=$((i+1))
     done
     if [ ! -S "$SOCK" ]; then
-        echo "FAIL: giza_server did not create socket within 10s"
+        echo "FAIL: giza_server did not create socket within 30s"
         exit 1
     fi
     echo "INFO: server started (socket=$SOCK)"

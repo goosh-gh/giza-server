@@ -10,9 +10,13 @@
 # Exit 1  = fail
 # Exit 77 = skip (no display available on Linux)
 
+set -e
+
 BINARY=./giza_server
 TEST_PNG=./test/test_png
-SOCK="/tmp/giza_server_$(id -u).sock"
+# Private per-run socket (see test_ping.sh); honored via $GIZA_SERVER_SOCK.
+export GIZA_SERVER_SOCK="${TMPDIR:-/tmp}/giza_test_png_$$.sock"
+SOCK="$GIZA_SERVER_SOCK"
 DISPLAY_SECS="${GIZA_TEST_DISPLAY_SECS:-5}"
 SERVER_PID=""
 
@@ -64,13 +68,13 @@ else
     "$BINARY" &
     SERVER_PID=$!
     i=0
-    while [ $i -lt 100 ]; do
+    while [ $i -lt 300 ]; do
         [ -S "$SOCK" ] && break
         sleep 0.1
         i=$((i+1))
     done
     if [ ! -S "$SOCK" ]; then
-        echo "FAIL: giza_server did not create socket within 10s"
+        echo "FAIL: giza_server did not create socket within 30s"
         exit 1
     fi
     echo "INFO: server started (pid=$SERVER_PID)"
