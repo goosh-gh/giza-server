@@ -78,6 +78,7 @@ typedef enum {
 typedef struct {
     CmdType          type;
     int              win_id;
+    int              fd;                           /* CMD_NEWWIN: client socket */
     int              width, height;               /* CMD_NEWWIN        */
     cairo_surface_t *surface;                     /* CMD_PNG (ref handed off) */
     char             title[MAX_TITLE_LEN + 1];    /* CMD_TITLE         */
@@ -221,7 +222,7 @@ static GsWindow *_find_or_create_win(int id)
 }
 
 static void
-_open_window(int id, int w, int h, const char *title)
+_open_window(int id, int client_fd, int w, int h, const char *title)
 {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (GS.wins[i].alive) continue;
@@ -233,7 +234,7 @@ _open_window(int id, int w, int h, const char *title)
         win->width   = w ? w : DEFAULT_WIN_W;
         win->height  = h ? h : DEFAULT_WIN_H;
         win->alive   = 1;
-        win->client_fd  = -1;
+        win->client_fd  = client_fd;   /* this window's own client socket */
         win->savereq_wr = -1;
         pthread_mutex_init(&win->write_lock, NULL);
         snprintf(win->title, sizeof(win->title), "%s", title[0] ? title : "giza");
@@ -334,7 +335,7 @@ _dispatch(Cmd *cmd)
     switch (cmd->type) {
 
     case CMD_NEWWIN:
-        _open_window(cmd->win_id, cmd->width, cmd->height, cmd->title);
+        _open_window(cmd->win_id, cmd->fd, cmd->width, cmd->height, cmd->title);
         break;
 
     case CMD_PNG:
@@ -443,12 +444,12 @@ _connection_thread(void *arg)
     int      wid = ca->win_id;
     free(ca);
 
-    /* Register client_fd on the window for SAVEREQ reverse-sends.   */
-    {
-        pthread_mutex_lock(&GS.wins[wid % MAX_WINDOWS].write_lock);
-        GS.wins[wid % MAX_WINDOWS].client_fd = fd;
-        pthread_mutex_unlock(&GS.wins[wid % MAX_WINDOWS].write_lock);
-    }
+    /* client_fd is bound to the window's own slot inside _open_window
+     * (CMD_NEWWIN carries fd). The previous registration here used
+     * GS.wins[wid % MAX_WINDOWS], a different slot than _open_window
+     * allocates, and ran before that slot's write_lock was initialized -
+     * so the window's real slot kept client_fd == -1 and close/reverse
+     * sends silently no-op'd. */
 
     uint32_t seq_out = 0;
 
@@ -478,6 +479,7 @@ _connection_thread(void *arg)
             if (!cmd) { free(payload); goto done; }
             cmd->type   = CMD_NEWWIN;
             cmd->win_id = wid;
+            cmd->fd     = fd;          /* wire client_fd to THIS window's slot */
             if (len >= sizeof(gsp_newwin_t)) {
                 gsp_newwin_t nw;
                 memcpy(&nw, payload, sizeof(nw));
