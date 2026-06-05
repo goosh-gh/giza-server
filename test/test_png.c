@@ -111,9 +111,7 @@ static char sock_path[256];
 static void
 make_sock_path(void)
 {
-    snprintf(sock_path, sizeof(sock_path),
-             GIZA_SERVER_SOCK_DIR "/" GIZA_SERVER_SOCK_NAME,
-             (int)getuid());
+    gsp_resolve_sock_path(sock_path, sizeof(sock_path));
 }
 
 static int

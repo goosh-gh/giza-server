@@ -610,8 +610,7 @@ static int
 _setup_socket(void)
 {
     /* sun_path is only 108 bytes on Linux; keep the path well under that. */
-    snprintf(GS.sock_path, sizeof(GS.sock_path),
-             GIZA_SERVER_SOCK_DIR "/" GIZA_SERVER_SOCK_NAME, (int)getuid());
+    gsp_resolve_sock_path(GS.sock_path, sizeof(GS.sock_path));
     if (strlen(GS.sock_path) >= 104) {
         fprintf(stderr, "giza_server: socket path too long: %s\n", GS.sock_path);
         return -1;

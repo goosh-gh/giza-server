@@ -31,9 +31,12 @@
  * File menu (Save):
  *   - Save as PNG  - viewer-side, lossless (writes the received PNG bytes
  *     kept in last_png).  Works for any client (C, Perl/Driver::GS).
- *   - Save as PDF / SVG - vector output is not yet implemented; for now a
- *     guidance dialog (alive client vs exited client).  True vector
- *     (re-render on demand) is future work.
+ *   - Save as PDF / SVG - true vector output via reverse channel: the
+ *     viewer sends SAVEREQ to the still-running client, which re-renders
+ *     the current figure to PDF/SVG and returns the bytes as SAVEDATA
+ *     (see _vectorSave: / _save_vector_for_fd).  If the client has already
+ *     exited there is nobody to re-render, so a guidance dialog is shown
+ *     (_vectorSaveExited:).
  *   - All three items are auto-disabled (validateMenuItem:) when no live
  *     giza window exists, so "selectable but silent" never happens.
  *
@@ -194,6 +197,7 @@ typedef struct {
     char       title[256];
     int        alive;
     int        client_fd;         /* socket back to client (-1 if none) */
+    uint32_t   group_id;          /* tab group (client PID); 0 = ungrouped */
     uint32_t   seq_out;           /* seq for SLIDER messages we send    */
     pthread_mutex_t write_lock;   /* serialize writes to client_fd      */
     NSData         *last_png;     /* latest page PNG (owned copy, for saving) */
@@ -523,9 +527,7 @@ void giza_server_cocoa_init(void)
     pthread_mutex_init(&GS.wins_lock, NULL);
     GS.listen_fd = -1;
 
-    snprintf(GS.sock_path, sizeof(GS.sock_path),
-             GIZA_SERVER_SOCK_DIR "/" GIZA_SERVER_SOCK_NAME,
-             (int)getuid());
+    gsp_resolve_sock_path(GS.sock_path, sizeof(GS.sock_path));
 
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -545,6 +547,7 @@ void giza_server_cocoa_init(void)
 typedef struct {
     int  suggested_w, suggested_h;
     int  client_fd;
+    uint32_t group_id;        /* client PID for tab grouping; 0 = none */
     char title[256];
     int  result_id;           /* filled in by main-thread block       */
     dispatch_semaphore_t sem;
@@ -570,6 +573,7 @@ static void _create_window_on_main(void *ptr)
     w->id        = idx;
     w->alive     = 1;
     w->client_fd = req->client_fd;
+    w->group_id  = req->group_id;
     w->seq_out   = 0;
     pthread_mutex_init(&w->write_lock, NULL);
     strncpy(w->title,
@@ -649,36 +653,59 @@ static void _create_window_on_main(void *ptr)
     w->window = win;
     w->view   = view;
 
+    /* ---- Tab grouping --------------------------------------------------
+     * Windows opened by the same client process (group_id == client PID)
+     * are gathered into one tab group, mirroring pdlcairo_viewer's
+     * per-batch tabs. We add the new window explicitly to an existing live
+     * group member with -addTabbedWindow:ordered: (deterministic; does not
+     * depend on the user's "prefer tabs" system setting). group_id == 0
+     * (e.g. C clients with no PID grouping) keeps standalone windows. */
+    NSWindow *tab_host = nil;
+    if (req->group_id != 0) {
+        if (@available(macOS 10.12, *)) {
+            win.tabbingIdentifier =
+                [NSString stringWithFormat:@"giza_grp_%u", req->group_id];
+            /* Host = the LAST live member of the group; inserting the new
+             * window above it appends at the end of the tab bar, giving
+             * natural creation order (1,2,3). Picking the first member and
+             * inserting above it would stack every new tab just after tab 1
+             * (1,3,2,...), so we keep scanning instead of breaking. */
+            pthread_mutex_lock(&GS.wins_lock);
+            for (int i = 0; i < GS.n_wins; ++i) {
+                GsWindow *o = &GS.wins[i];
+                if (i != idx && o->alive && o->window &&
+                    o->group_id == req->group_id) {
+                    tab_host = o->window;
+                }
+            }
+            pthread_mutex_unlock(&GS.wins_lock);
+        }
+    }
 
     [[NSProcessInfo processInfo] disableAutomaticTermination:@"window open"];
 
+    if (tab_host) {
+        if (@available(macOS 10.12, *))
+            [tab_host addTabbedWindow:win ordered:NSWindowAbove];
+    }
     [win makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 
     req->result_id = idx;
     dispatch_semaphore_signal(req->sem);
-
-
-
-    /* Tab grouping - all giza_server windows share one tabbing ID */
-//   if (@available(macOS 10.12, *)) {
-//        win.tabbingIdentifier = @"giza_server_windows";
-//        win.tabbingMode       = NSWindowTabbingModePreferred;
-//    }
-
-
 }
 
 /* Synchronously create a window from a non-main thread               */
 
 
 static int _create_window_sync(int w_px, int h_px, const char *title,
-                               int client_fd)
+                               int client_fd, uint32_t group_id)
 {
     NewWinReq *req = calloc(1, sizeof(*req));
     req->suggested_w = w_px;
     req->suggested_h = h_px;
     req->client_fd   = client_fd;
+    req->group_id    = group_id;
     strncpy(req->title, title ? title : "giza", sizeof(req->title) - 1);
     req->result_id = -1;
     req->sem = dispatch_semaphore_create(0);
@@ -920,6 +947,18 @@ static void *_handle_connection(void *arg)
     int       fd = ca->fd;
     free(ca);
 
+    /* Tab grouping key: the connecting client's PID. All windows opened by
+     * the same process land in one tab group. Unavailable -> 0 (ungrouped). */
+    uint32_t peer_pid = 0;
+#ifdef LOCAL_PEERPID
+    {
+        pid_t pid = 0;
+        socklen_t pl = sizeof(pid);
+        if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &pl) == 0 && pid > 0)
+            peer_pid = (uint32_t)pid;
+    }
+#endif
+
     int      current_win = -1;
     uint32_t seq_out     = 0;
     char     title_buf[256] = {0};
@@ -958,7 +997,7 @@ static void *_handle_connection(void *arg)
                 memcpy(&nw, payload, sizeof(nw));
             const char *ttl = title_buf[0] ? title_buf : "giza";
             current_win = _create_window_sync(nw.width_px, nw.height_px,
-                                              ttl, fd);
+                                              ttl, fd, peer_pid);
             _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
             break;
         }
@@ -985,7 +1024,7 @@ static void *_handle_connection(void *arg)
         case GSP_MSG_PNG: {
 
             if (current_win < 0)
-                current_win = _create_window_sync(800, 600, "giza", fd);
+                current_win = _create_window_sync(800, 600, "giza", fd, peer_pid);
             if (current_win >= 0) {
                 _update_window(current_win, payload, hdr.length, title_buf);
                 payload = NULL;

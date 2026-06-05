@@ -442,9 +442,7 @@ int main(int argc, char **argv)
     gtk_init(&argc, &argv);
 
     /* Build socket path */
-    snprintf(GS.sock_path, sizeof(GS.sock_path),
-             GIZA_SERVER_SOCK_DIR "/" GIZA_SERVER_SOCK_NAME,
-             (int)getuid());
+    gsp_resolve_sock_path(GS.sock_path, sizeof(GS.sock_path));
     unlink(GS.sock_path);   /* remove stale socket if any */
 
     /* Create Unix socket service */

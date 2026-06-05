@@ -172,8 +172,7 @@ static int render_and_send(double k, double amp){
 
 int main(void){
     char path[256];
-    snprintf(path,sizeof(path),
-             GIZA_SERVER_SOCK_DIR "/" GIZA_SERVER_SOCK_NAME,(int)getuid());
+    gsp_resolve_sock_path(path, sizeof(path));
     g_fd=socket(AF_UNIX,SOCK_STREAM,0);
     struct sockaddr_un a; memset(&a,0,sizeof(a)); a.sun_family=AF_UNIX;
     strncpy(a.sun_path,path,sizeof(a.sun_path)-1);

@@ -18,6 +18,10 @@
 #define GIZA_SERVER_PROTOCOL_H
 
 #include <stdint.h>
+#include <stdlib.h>   /* getenv   */
+#include <unistd.h>   /* getuid   */
+#include <stdio.h>    /* snprintf */
+#include <string.h>   /* strncpy  */
 
 /* ------------------------------------------------------------------ */
 /* Socket path                                                         */
@@ -28,6 +32,28 @@
 #define GIZA_SERVER_SOCK_DIR  "/tmp"
 #define GIZA_SERVER_SOCK_NAME "giza_server_%d.sock"   /* %d = uid     */
 /* Full path constructed at runtime: /tmp/giza_server_<uid>.sock      */
+
+/* Resolve the giza_server socket path into buf (size n).
+ * Precedence:
+ *   1. $GIZA_SERVER_SOCK  - explicit path: isolated/parallel servers and
+ *                           the test harness (each test owns its socket).
+ *   2. /tmp/giza_server_<uid>.sock  - default, one server per user.
+ * Always NUL-terminated. Shared by the viewer, the test clients and the
+ * examples so every component agrees on the path. The Perl Driver::GS
+ * applies the same precedence in _sock_path(). */
+static inline void
+gsp_resolve_sock_path(char *buf, size_t n)
+{
+    const char *env = getenv("GIZA_SERVER_SOCK");
+    if (env && env[0]) {
+        strncpy(buf, env, n - 1);
+        buf[n - 1] = '\0';
+    } else {
+        snprintf(buf, n,
+                 GIZA_SERVER_SOCK_DIR "/" GIZA_SERVER_SOCK_NAME,
+                 (int)getuid());
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Protocol magic & version                                            */
