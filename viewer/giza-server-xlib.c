@@ -277,18 +277,50 @@ _repaint_window(GsWindow *win)
     XFlush(GS.dpy);
 }
 
+/* Tear down a window's resources and, for a user-initiated close, signal an
+ * interactive client so it stops blocking.
+ *
+ * user_initiated:
+ *   1  the user closed the window (WM_DELETE). An interactive client
+ *      (Perl Driver::GS show_interactive) is blocked reading its socket and
+ *      its run loop only returns on EOF, so we shutdown() its fd here. We
+ *      shutdown(SHUT_RDWR), never close(): it delivers EOF to the client and
+ *      wakes our own connection thread, which then performs the single
+ *      close() in its teardown (see _connection_thread `done:`). Using
+ *      close() here would race fd reuse against a concurrent accept().
+ *   0  the client asked us to close (GSP_MSG_CLOSE). Its connection thread is
+ *      already on its way to close the fd, so we must NOT touch it.
+ *
+ * One connection backs exactly one window in this backend (the connection
+ * thread binds a fixed win_id), so there is no shared-fd sibling case: the
+ * window owns its fd outright. client_fd is read and cleared under write_lock
+ * before the lock is destroyed; in the user-initiated case the connection
+ * thread is parked in read() and not touching the lock, and the shutdown is
+ * issued last, after the slot is marked dead (alive=0), so when the thread
+ * wakes it skips the now-destroyed lock and just close()s. */
 static void
-_close_window(int id)
+_close_window(int id, int user_initiated)
 {
     GsWindow *win = _find_or_create_win(id);
     if (!win) return;
+
+    int fd = -1;
+    pthread_mutex_lock(&win->write_lock);
+    fd = win->client_fd;
+    win->client_fd = -1;          /* stop reverse sends */
+    pthread_mutex_unlock(&win->write_lock);
+
     XDestroyWindow(GS.dpy, win->xwin);
     XFreeGC(GS.dpy, win->gc);
     if (win->surface) { cairo_surface_destroy(win->surface); win->surface = NULL; }
     free(win->save_path);
+    win->save_path = NULL;
     pthread_mutex_destroy(&win->write_lock);
     win->alive = 0;
     GS.n_wins--;
+
+    if (user_initiated && fd >= 0)
+        shutdown(fd, SHUT_RDWR);
 }
 
 /* ------------------------------------------------------------------ */
@@ -327,7 +359,7 @@ _dispatch(Cmd *cmd)
         break;
 
     case CMD_CLOSE:
-        _close_window(cmd->win_id);
+        _close_window(cmd->win_id, 0);   /* client asked: it closes its own fd */
         break;
 
     case CMD_SAVEPATH:
@@ -378,10 +410,11 @@ _handle_xevent(XEvent *ev)
 
     case ClientMessage:
         if ((Atom)ev->xclient.data.l[0] == GS.wm_delete) {
-            /* User closed a window — find it and mark dead.          */
+            /* User closed a window — mark dead and signal an interactive
+             * client (EOF) so its run loop returns instead of blocking. */
             for (int i = 0; i < MAX_WINDOWS; i++) {
                 if (GS.wins[i].alive && GS.wins[i].xwin == ev->xclient.window) {
-                    _close_window(GS.wins[i].id);
+                    _close_window(GS.wins[i].id, 1);
                     break;
                 }
             }

@@ -26,19 +26,25 @@
  *   explicit "discard": windowWillClose: marks the slot dead (alive=0),
  *   nils window/view, frees last_png.  Slots are never compacted - the
  *   array index is the win_id, so closed slots stay as holes and every
- *   reader checks `alive`.
+ *   reader checks `alive`.  Closing also shutdown()s the client socket when
+ *   it was that window's last live tab, so an interactive client
+ *   (show_interactive) blocked reading the socket gets EOF and its run loop
+ *   returns - it no longer waits for Cmd-Q.
  *
  * File menu (Save):
  *   - Save as PNG  - viewer-side, lossless (writes the received PNG bytes
- *     kept in last_png).  Works for any client (C, Perl/Driver::GS).
+ *     kept in last_png).  Works for any client (C, Perl/Driver::GS), and
+ *     even after the client has exited, since the bytes are held locally.
  *   - Save as PDF / SVG - true vector output via reverse channel: the
  *     viewer sends SAVEREQ to the still-running client, which re-renders
  *     the current figure to PDF/SVG and returns the bytes as SAVEDATA
  *     (see _vectorSave: / _save_vector_for_fd).  If the client has already
- *     exited there is nobody to re-render, so a guidance dialog is shown
- *     (_vectorSaveExited:).
- *   - All three items are auto-disabled (validateMenuItem:) when no live
- *     giza window exists, so "selectable but silent" never happens.
+ *     exited there is nobody to re-render, so these items gray out
+ *     (validateMenuItem: checks client_fd); the _vectorSaveExited: dialog
+ *     remains only as a defensive fallback for a client that dies between
+ *     validation and the action firing.
+ *   - All Save items also gray out when no live giza window exists, so
+ *     "selectable but silent" never happens.
  *
  * Reusable lessons (persistent-window GUI, apply if Driver::OSX /
  * pdlcairo_viewer ever grows a Save dialog):
@@ -283,17 +289,33 @@ static BOOL _gsview_is_live(GsView *v)
     return nil;
 }
 
-/* Menu item enable/disable. The three Save items are disabled (grayed
- * out) when there is no live giza window to save. This prevents the
- * "selectable but silent" trap - they gray out e.g. after all windows
- * have been closed via the red button. */
+/* Menu item enable/disable. PNG and the two vector items have different
+ * requirements, so they are validated separately:
+ *
+ *   Save as PNG  - served from the retained last_png buffer, so it works
+ *                  for any live window, even one whose client has exited
+ *                  (a plain show() window after its script finished). Enabled
+ *                  whenever the front window has a frame buffered.
+ *   Save as PDF/SVG - true vector output needs the client alive to re-render
+ *                  over the reverse channel. For a client-absent window there
+ *                  is nobody to render, so these gray out (rather than being
+ *                  pressable only to raise the "program has exited" dialog).
+ *
+ * All three still gray out when no live giza window exists at all. Reads of
+ * last_png / client_fd here are on the main thread; last_png is only mutated
+ * on the main thread, and a stale client_fd read is harmless because
+ * _vectorSave: re-checks it under write_lock before sending SAVEREQ. */
 - (BOOL)validateMenuItem:(NSMenuItem *)item
 {
     SEL a = [item action];
-    if (a == @selector(savePNG:) ||
-        a == @selector(savePDF:) ||
-        a == @selector(saveSVG:)) {
-        return ([self _frontGsView] != nil);
+
+    if (a == @selector(savePNG:)) {
+        GsView *v = [self _frontGsView];
+        return (v != nil && GS.wins[v->win_id].last_png != nil);
+    }
+    if (a == @selector(savePDF:) || a == @selector(saveSVG:)) {
+        GsView *v = [self _frontGsView];
+        return (v != nil && GS.wins[v->win_id].client_fd >= 0);
     }
     return YES;
 }
@@ -447,15 +469,42 @@ static BOOL _gsview_is_live(GsView *v)
  * n_wins is NOT decremented (array index == win_id must stay stable, so
  * closed slots remain as holes). Every reader (_update_window,
  * _slider_send, the save actions) treats such a slot as "gone" by
- * checking alive and the niled refs. */
+ * checking alive and the niled refs.
+ *
+ * Closing also tears down the client connection so an INTERACTIVE client
+ * (Perl Driver::GS show_interactive) stops blocking. Its run loop reads the
+ * socket and returns on EOF; until server11 the fd was only ever closed at
+ * process exit, so the loop blocked until Cmd-Q. Now we shutdown() the fd
+ * when this was its last live window, which delivers EOF to the client and
+ * also wakes our own per-connection reader (it then runs its normal
+ * disconnect teardown and performs the single close()).
+ *
+ * Tab / window-group semantics fall out naturally: each tab is its own
+ * NSWindow, so closing one tab fires windowWillClose: for that window only,
+ * and closing a whole tab group fires it once per member. One connection can
+ * back several windows ("one connection, many windows"), so we only shut the
+ * fd down when no OTHER live window still uses it - closing one tab must not
+ * sever its siblings. Cmd-Q still closes everything via process exit.
+ *
+ * We use shutdown(SHUT_RDWR), never close(), here:
+ *   - it does not free the fd number, so there is no reuse race with a
+ *     concurrent accept(); the owning reader thread still does the one close()
+ *   - SHUT_WR delivers EOF to the client (run loop returns)
+ *   - SHUT_RD makes our reader's blocked read() return 0 promptly
+ * client_fd is flipped to -1 under write_lock first, so the slider/savereq
+ * reverse-send paths never grab the fd we are about to shut down. */
 - (void)windowWillClose:(NSNotification *)note
 {
     NSWindow *closing = [note object];
+
+    int fd_to_shutdown = -1;
 
     pthread_mutex_lock(&GS.wins_lock);
     for (int i = 0; i < GS.n_wins; i++) {
         GsWindow *w = &GS.wins[i];
         if (!w->alive || w->window != closing) continue;
+
+        int fd = w->client_fd;        /* remember before we clear it */
 
         pthread_mutex_lock(&w->write_lock);
         w->client_fd = -1;            /* stop reverse sends (discard even if alive) */
@@ -469,9 +518,28 @@ static BOOL _gsview_is_live(GsView *v)
         NSData *old = w->last_png;
         w->last_png = nil;
         [old release];
+
+        /* Tear the connection down only if this was its last live window.
+         * (fd < 0 already means the client had exited - nothing to signal,
+         * e.g. a plain show() window after its script finished.) */
+        if (fd >= 0) {
+            int still_used = 0;
+            for (int j = 0; j < GS.n_wins; j++) {
+                if (j == i) continue;
+                if (GS.wins[j].alive && GS.wins[j].client_fd == fd) {
+                    still_used = 1;
+                    break;
+                }
+            }
+            if (!still_used) fd_to_shutdown = fd;
+        }
         break;                        /* window is unique: one slot, done */
     }
     pthread_mutex_unlock(&GS.wins_lock);
+
+    /* Outside the lock (shutdown is a syscall; no window state involved). */
+    if (fd_to_shutdown >= 0)
+        shutdown(fd_to_shutdown, SHUT_RDWR);
 }
 
 @end
