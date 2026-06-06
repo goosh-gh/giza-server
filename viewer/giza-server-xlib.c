@@ -54,8 +54,17 @@
 
 #define DEFAULT_WIN_W   800
 #define DEFAULT_WIN_H   600
-#define MAX_WINDOWS     64
+#define MAX_WINDOWS     64          /* total figures (tabs) across all containers */
+#define MAX_CONTAINERS  MAX_WINDOWS /* worst case: every figure standalone        */
 #define MAX_TITLE_LEN   255
+
+/* Tab bar (drawn only when a container holds >= 2 figures). Xlib has no
+ * native window tabbing, so we paint our own strip at the top of the
+ * container window and route clicks: a hit on a tab body selects it, a hit
+ * on the tab's small "x" box closes that figure. Mirrors the Cocoa backend,
+ * which gets the same grouping for free via NSWindowTabbingIdentifier. */
+#define TABBAR_H        26          /* tab strip height (px)                  */
+#define TAB_CLOSE_BOX   16          /* clickable close-x region width (px)    */
 
 /* Interactive sliders (viewer-side fixed controls, mirroring the Cocoa
  * backend): a horizontal strip at the bottom drives slider id 0 (freq k)
@@ -91,6 +100,7 @@ typedef struct {
     CmdType          type;
     int              win_id;
     int              fd;                           /* CMD_NEWWIN: client socket */
+    uint32_t         group_id;                    /* CMD_NEWWIN: client PID (tab group); 0 = standalone */
     int              width, height;               /* CMD_NEWWIN        */
     cairo_surface_t *surface;                     /* CMD_PNG (ref handed off) */
     char             title[MAX_TITLE_LEN + 1];    /* CMD_TITLE         */
@@ -121,13 +131,13 @@ static void _send_cmd(Cmd *cmd)
 /* Per-window state (accessed only from main thread except where noted)*/
 /* ------------------------------------------------------------------ */
 
+/* A GsWindow is one figure = one tab. It no longer owns an X window; the X
+ * window belongs to the GsContainer it lives in (win->container). Several
+ * tabs sharing a container = a tabbed window. */
 typedef struct {
     int              id;
-    Window           xwin;
-    Display         *dpy;       /* same as global, kept for convenience */
-    GC               gc;
+    int              container;  /* index into GS.conts[]; -1 if unattached  */
     cairo_surface_t *surface;   /* current Cairo surface (IMAGE type)  */
-    int              width, height;
     char             title[MAX_TITLE_LEN + 1];
     int              alive;     /* 0 once closed                        */
 
@@ -145,6 +155,17 @@ typedef struct {
     double           sld_val[2];
 } GsWindow;
 
+/* A GsContainer owns one X top-level window and groups 1..N tabs (figures)
+ * that share a client PID. Touched only from the main (X) thread. */
+typedef struct {
+    int        alive;
+    Window     xwin;
+    GC         gc;
+    uint32_t   group_id;    /* client PID; 0 = standalone (never shares)  */
+    int        width, height;
+    int        active;      /* GS.wins[] slot index of the visible tab; -1 */
+} GsContainer;
+
 /* ------------------------------------------------------------------ */
 /* Global server state                                                 */
 /* ------------------------------------------------------------------ */
@@ -154,11 +175,18 @@ static struct {
     int         screen;
     Atom        wm_delete;     /* WM_DELETE_WINDOW atom                */
     GsWindow    wins[MAX_WINDOWS];
+    GsContainer conts[MAX_CONTAINERS];
     pthread_mutex_t wins_lock;
     char        sock_path[256];
     int         n_wins;
     int         listen_fd;
 } GS;
+
+/* Forward declarations (definitions appear below in dependency-free order). */
+static void _repaint_container(GsContainer *c);
+static void _set_container_title(GsContainer *c);
+static int  _container_tabs(int ci, int *out, int max);
+static void _close_tab(int id, int user_initiated);
 
 /* ------------------------------------------------------------------ */
 /* Cairo PNG-from-memory                                               */
@@ -257,65 +285,148 @@ static GsWindow *_find_or_create_win(int id)
     return NULL;
 }
 
-static void
-_open_window(int id, int client_fd, int w, int h, const char *title)
-{
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (GS.wins[i].alive) continue;
-
-        GsWindow *win = &GS.wins[i];
-        memset(win, 0, sizeof(*win));
-        win->id      = id;
-        win->dpy     = GS.dpy;
-        win->width   = w ? w : DEFAULT_WIN_W;
-        win->height  = h ? h : DEFAULT_WIN_H;
-        win->alive   = 1;
-        win->client_fd  = client_fd;   /* this window's own client socket */
-        win->savereq_wr = -1;
-        pthread_mutex_init(&win->write_lock, NULL);
-        win->sld_val[0] = 1.0;   /* k initial (matches Cocoa) */
-        win->sld_val[1] = 1.0;   /* A initial                 */
-        snprintf(win->title, sizeof(win->title), "%s", title[0] ? title : "giza");
-
-        win->xwin = XCreateSimpleWindow(
-            GS.dpy, RootWindow(GS.dpy, GS.screen),
-            0, 0, (unsigned)win->width, (unsigned)win->height,
-            1,
-            BlackPixel(GS.dpy, GS.screen),
-            WhitePixel(GS.dpy, GS.screen));
-
-        XStoreName(GS.dpy, win->xwin, win->title);
-        XSetWMProtocols(GS.dpy, win->xwin, &GS.wm_delete, 1);
-        win->gc = XCreateGC(GS.dpy, win->xwin, 0, NULL);
-        XSelectInput(GS.dpy, win->xwin,
-                     ExposureMask | StructureNotifyMask |
-                     ButtonPressMask | Button1MotionMask);
-        XMapRaised(GS.dpy, win->xwin);
-        GS.n_wins++;
-        return;
-    }
-    fprintf(stderr, "giza_server: too many windows (max %d)\n", MAX_WINDOWS);
-}
-
 static double _clampd(double v, double lo, double hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/* Draw the two slider strips (bottom = k, right = A) with their thumbs,
- * over the painted plot. Called from _repaint_window with a live cairo_t
- * on the window's xlib surface. */
-static void
-_draw_sliders(cairo_t *cr, GsWindow *win)
+/* Collect the GS.wins[] slot indices of the live tabs in container ci, in
+ * slot (≈creation) order. Returns the count. Main-thread only. */
+static int _container_tabs(int ci, int *out, int max)
 {
-    double pw = (double)win->width  - SLIDER_W;   /* plot-area width  */
-    double ph = (double)win->height - SLIDER_H;   /* plot-area height */
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS && n < max; i++)
+        if (GS.wins[i].alive && GS.wins[i].container == ci)
+            out[n++] = i;
+    return n;
+}
+
+/* Find the live container holding group gid (a client PID). gid 0 never
+ * shares a window, so it always reports "no container" → a fresh one. */
+static int _find_container_by_group(uint32_t gid)
+{
+    if (gid == 0) return -1;
+    for (int i = 0; i < MAX_CONTAINERS; i++)
+        if (GS.conts[i].alive && GS.conts[i].group_id == gid)
+            return i;
+    return -1;
+}
+
+/* Create a new X top-level window to host a tab group. Returns container
+ * index or -1. */
+static int _create_container(uint32_t gid, int w, int h)
+{
+    for (int i = 0; i < MAX_CONTAINERS; i++) {
+        if (GS.conts[i].alive) continue;
+        GsContainer *c = &GS.conts[i];
+        memset(c, 0, sizeof(*c));
+        c->alive    = 1;
+        c->group_id = gid;
+        c->width    = w ? w : DEFAULT_WIN_W;
+        c->height   = h ? h : DEFAULT_WIN_H;
+        c->active   = -1;
+
+        c->xwin = XCreateSimpleWindow(
+            GS.dpy, RootWindow(GS.dpy, GS.screen),
+            0, 0, (unsigned)c->width, (unsigned)c->height, 1,
+            BlackPixel(GS.dpy, GS.screen),
+            WhitePixel(GS.dpy, GS.screen));
+        XSetWMProtocols(GS.dpy, c->xwin, &GS.wm_delete, 1);
+        c->gc = XCreateGC(GS.dpy, c->xwin, 0, NULL);
+        XSelectInput(GS.dpy, c->xwin,
+                     ExposureMask | StructureNotifyMask |
+                     ButtonPressMask | Button1MotionMask);
+        XMapRaised(GS.dpy, c->xwin);
+        return i;
+    }
+    fprintf(stderr, "giza_server: too many containers (max %d)\n", MAX_CONTAINERS);
+    return -1;
+}
+
+/* The WM title tracks the active tab's title. */
+static void _set_container_title(GsContainer *c)
+{
+    int ci = (int)(c - GS.conts);
+    const char *t = "giza";
+    if (c->active >= 0 && GS.wins[c->active].alive &&
+        GS.wins[c->active].container == ci)
+        t = GS.wins[c->active].title;
+    XStoreName(GS.dpy, c->xwin, t);
+}
+
+/* Open a new figure (tab). With a client PID (group_id != 0) the figure
+ * joins that client's existing container as a new tab; otherwise (or if the
+ * client has none yet) a fresh container window is created. The new tab
+ * becomes active. */
+static void
+_open_window(int id, int client_fd, int w, int h, const char *title,
+             uint32_t group_id)
+{
+    int slot = -1;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (!GS.wins[i].alive) { slot = i; break; }
+    if (slot < 0) {
+        fprintf(stderr, "giza_server: too many windows (max %d)\n", MAX_WINDOWS);
+        return;
+    }
+
+    int newc = 0;
+    int ci = _find_container_by_group(group_id);
+    if (ci < 0) {
+        ci = _create_container(group_id, w, h);
+        newc = 1;
+        if (ci < 0) return;
+    }
+
+    GsWindow *win = &GS.wins[slot];
+    memset(win, 0, sizeof(*win));
+    win->id        = id;
+    win->container = ci;
+    win->alive     = 1;
+    win->client_fd  = client_fd;   /* this tab's own client socket */
+    win->savereq_wr = -1;
+    pthread_mutex_init(&win->write_lock, NULL);
+    win->sld_val[0] = 1.0;   /* k initial (matches Cocoa) */
+    win->sld_val[1] = 1.0;   /* A initial                 */
+    snprintf(win->title, sizeof(win->title), "%s", title[0] ? title : "giza");
+
+    GS.conts[ci].active = slot;    /* newly opened tab is shown */
+    GS.n_wins++;
+
+    _set_container_title(&GS.conts[ci]);
+    if (!newc) XRaiseWindow(GS.dpy, GS.conts[ci].xwin);
+    _repaint_container(&GS.conts[ci]);
+}
+
+/* Geometry of the container's body — where the active tab's plot + sliders
+ * are drawn. The tab bar steals the top TABBAR_H only when 2+ tabs exist. */
+static void _body_geom(GsContainer *c, int n_tabs,
+                       int *bx, int *by, int *bw, int *bh)
+{
+    int top = (n_tabs >= 2) ? TABBAR_H : 0;
+    *bx = 0;
+    *by = top;
+    *bw = c->width;
+    *bh = c->height - top;
+}
+
+/* Draw the two slider strips (bottom = k, right = A) within the body
+ * rectangle (bx,by,bw,bh). Called from _repaint_container with a live
+ * cairo_t on the container's xlib surface. */
+static void
+_draw_sliders(cairo_t *cr, GsWindow *win, int bx, int by, int bw, int bh)
+{
+    double pw = (double)bw - SLIDER_W;   /* plot-area width  (body-local) */
+    double ph = (double)bh - SLIDER_H;   /* plot-area height (body-local) */
     if (pw < 20.0 || ph < 20.0) return;
+
+    cairo_save(cr);
+    cairo_translate(cr, bx, by);
 
     /* strip backgrounds */
     cairo_set_source_rgb(cr, 0.88, 0.88, 0.88);
-    cairo_rectangle(cr, 0.0, ph, (double)win->width,  (double)SLIDER_H);
-    cairo_rectangle(cr, pw,  0.0, (double)SLIDER_W,    (double)win->height);
+    cairo_rectangle(cr, 0.0, ph, (double)bw, (double)SLIDER_H);
+    cairo_rectangle(cr, pw,  0.0, (double)SLIDER_W, (double)bh);
     cairo_fill(cr);
 
     cairo_set_line_width(cr, 2.0);
@@ -341,56 +452,180 @@ _draw_sliders(cairo_t *cr, GsWindow *win)
     cairo_set_source_rgb(cr, 0.20, 0.40, 0.80);
     cairo_arc(cr, cxv, 8.0 + (1.0 - af) * (ph - 16.0), 7.0, 0.0, TWO_PI);
     cairo_fill(cr);
+
+    cairo_restore(cr);
 }
 
-static void
-_repaint_window(GsWindow *win)
+/* X coordinate (left edge) where the close-x of tab i sits in the bar. */
+static double _tab_close_cx(double x0, double tw)
 {
-    if (!win || !win->surface || !win->alive) return;
+    return x0 + tw - TAB_CLOSE_BOX / 2.0 - 4.0;
+}
 
-    /* Draw via cairo-xlib surface */
+/* Draw the tab strip across the top of the container. tabs[] holds n>=2
+ * live slot indices in display order. */
+static void
+_draw_tabbar(cairo_t *cr, GsContainer *c, const int *tabs, int n)
+{
+    double W  = (double)c->width;
+    double tw = W / n;
+
+    cairo_select_font_face(cr, "sans-serif",
+                           CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 12.0);
+
+    for (int i = 0; i < n; i++) {
+        GsWindow *t   = &GS.wins[tabs[i]];
+        double    x0  = i * tw;
+        int       act = (tabs[i] == c->active);
+
+        /* tab background */
+        if (act) cairo_set_source_rgb(cr, 1.00, 1.00, 1.00);
+        else     cairo_set_source_rgb(cr, 0.82, 0.82, 0.82);
+        cairo_rectangle(cr, x0, 0.0, tw, (double)TABBAR_H);
+        cairo_fill(cr);
+
+        /* left separator */
+        cairo_set_source_rgb(cr, 0.60, 0.60, 0.60);
+        cairo_set_line_width(cr, 1.0);
+        cairo_move_to(cr, x0 + 0.5, 0.0);
+        cairo_line_to(cr, x0 + 0.5, (double)TABBAR_H);
+        cairo_stroke(cr);
+
+        /* label (clipped to the tab, leaving room for the close box) */
+        cairo_save(cr);
+        cairo_rectangle(cr, x0 + 6.0, 0.0,
+                        tw - 6.0 - (double)TAB_CLOSE_BOX, (double)TABBAR_H);
+        cairo_clip(cr);
+        cairo_set_source_rgb(cr, 0.10, 0.10, 0.10);
+        cairo_move_to(cr, x0 + 8.0, TABBAR_H / 2.0 + 4.0);
+        cairo_show_text(cr, t->title);
+        cairo_restore(cr);
+
+        /* close "x" box */
+        double cx = _tab_close_cx(x0, tw);
+        double cy = TABBAR_H / 2.0;
+        double r  = 4.0;
+        cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
+        cairo_set_line_width(cr, 1.5);
+        cairo_move_to(cr, cx - r, cy - r); cairo_line_to(cr, cx + r, cy + r);
+        cairo_move_to(cr, cx + r, cy - r); cairo_line_to(cr, cx - r, cy + r);
+        cairo_stroke(cr);
+    }
+
+    /* bottom edge under the whole bar */
+    cairo_set_source_rgb(cr, 0.60, 0.60, 0.60);
+    cairo_set_line_width(cr, 1.0);
+    cairo_move_to(cr, 0.0, TABBAR_H - 0.5);
+    cairo_line_to(cr, W,   TABBAR_H - 0.5);
+    cairo_stroke(cr);
+}
+
+/* Hit-test a click in the tab bar. Returns the clicked tab's slot index (or
+ * -1), and sets *want_close when the click landed on that tab's close box. */
+static int
+_tabbar_hit(GsContainer *c, const int *tabs, int n, int ex, int ey,
+            int *want_close)
+{
+    *want_close = 0;
+    if (ey < 0 || ey >= TABBAR_H) return -1;
+    double tw = (double)c->width / n;
+    int i = (int)((double)ex / tw);
+    if (i < 0 || i >= n) return -1;
+
+    double x0 = i * tw;
+    double cx = _tab_close_cx(x0, tw);
+    int d = ex - (int)cx;
+    if (d < 0) d = -d;
+    if (d <= TAB_CLOSE_BOX / 2 + 2) *want_close = 1;
+    return tabs[i];
+}
+
+/* Repaint a container: clear, paint the active tab's surface + sliders into
+ * the body, then the tab bar on top (if 2+ tabs). */
+static void
+_repaint_container(GsContainer *c)
+{
+    if (!c || !c->alive) return;
+    int ci = (int)(c - GS.conts);
+
+    int tabs[MAX_WINDOWS];
+    int n = _container_tabs(ci, tabs, MAX_WINDOWS);
+
     cairo_surface_t *xsurf = cairo_xlib_surface_create(
-        GS.dpy, win->xwin, DefaultVisual(GS.dpy, GS.screen),
-        win->width, win->height);
+        GS.dpy, c->xwin, DefaultVisual(GS.dpy, GS.screen),
+        c->width, c->height);
     if (cairo_surface_status(xsurf) != CAIRO_STATUS_SUCCESS) {
         cairo_surface_destroy(xsurf);
         return;
     }
     cairo_t *cr = cairo_create(xsurf);
-    cairo_set_source_surface(cr, win->surface, 0, 0);
+
+    /* clear */
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
     cairo_paint(cr);
-    _draw_sliders(cr, win);
+
+    /* resolve active tab (repair if the stored active is stale) */
+    GsWindow *win = NULL;
+    if (c->active >= 0 && GS.wins[c->active].alive &&
+        GS.wins[c->active].container == ci) {
+        win = &GS.wins[c->active];
+    } else if (n > 0) {
+        c->active = tabs[0];
+        win = &GS.wins[tabs[0]];
+    }
+
+    int bx, by, bw, bh;
+    _body_geom(c, n, &bx, &by, &bw, &bh);
+
+    if (win && win->surface) {
+        cairo_save(cr);
+        cairo_set_source_surface(cr, win->surface, bx, by);
+        cairo_paint(cr);
+        cairo_restore(cr);
+        _draw_sliders(cr, win, bx, by, bw, bh);
+    }
+
+    if (n >= 2)
+        _draw_tabbar(cr, c, tabs, n);
+
     cairo_destroy(cr);
     cairo_surface_destroy(xsurf);
     XFlush(GS.dpy);
 }
 
-/* Tear down a window's resources and, for a user-initiated close, signal an
+/* Tear down one figure (tab) and, for a user-initiated close, signal an
  * interactive client so it stops blocking.
  *
  * user_initiated:
- *   1  the user closed the window (WM_DELETE). An interactive client
- *      (Perl Driver::GS show_interactive) is blocked reading its socket and
- *      its run loop only returns on EOF, so we shutdown() its fd here. We
- *      shutdown(SHUT_RDWR), never close(): it delivers EOF to the client and
- *      wakes our own connection thread, which then performs the single
- *      close() in its teardown (see _connection_thread `done:`). Using
- *      close() here would race fd reuse against a concurrent accept().
+ *   1  the user discarded the figure (WM_DELETE on the container, or a click
+ *      on the tab's close "x"). An interactive client (Perl Driver::GS
+ *      show_interactive) is blocked reading its socket and its run loop only
+ *      returns on EOF, so we shutdown() its fd here. We shutdown(SHUT_RDWR),
+ *      never close(): it delivers EOF to the client and wakes our own
+ *      connection thread, which then performs the single close() in its
+ *      teardown (see _connection_thread `done:`). Using close() here would
+ *      race fd reuse against a concurrent accept().
  *   0  the client asked us to close (GSP_MSG_CLOSE). Its connection thread is
  *      already on its way to close the fd, so we must NOT touch it.
  *
- * One connection backs exactly one window in this backend (the connection
- * thread binds a fixed win_id), so there is no shared-fd sibling case: the
- * window owns its fd outright. client_fd is read and cleared under write_lock
- * before the lock is destroyed; in the user-initiated case the connection
- * thread is parked in read() and not touching the lock, and the shutdown is
- * issued last, after the slot is marked dead (alive=0), so when the thread
- * wakes it skips the now-destroyed lock and just close()s. */
+ * One connection backs exactly one tab in this backend (the connection thread
+ * binds a fixed win_id), so there is no shared-fd sibling case: the tab owns
+ * its fd outright. client_fd is read and cleared under write_lock before the
+ * lock is destroyed; in the user-initiated case the connection thread is
+ * parked in read() and not touching the lock, and the shutdown is issued
+ * last, after the slot is marked dead (alive=0), so when the thread wakes it
+ * skips the now-destroyed lock and just close()s.
+ *
+ * The container's X window is destroyed only when its last tab goes away;
+ * otherwise the bar/body reflow and the container is repainted. */
 static void
-_close_window(int id, int user_initiated)
+_close_tab(int id, int user_initiated)
 {
     GsWindow *win = _find_or_create_win(id);
     if (!win) return;
+    int slot = (int)(win - GS.wins);
+    int ci   = win->container;
 
     int fd = -1;
     pthread_mutex_lock(&win->write_lock);
@@ -398,17 +633,46 @@ _close_window(int id, int user_initiated)
     win->client_fd = -1;          /* stop reverse sends */
     pthread_mutex_unlock(&win->write_lock);
 
-    XDestroyWindow(GS.dpy, win->xwin);
-    XFreeGC(GS.dpy, win->gc);
     if (win->surface) { cairo_surface_destroy(win->surface); win->surface = NULL; }
     free(win->save_path);
     win->save_path = NULL;
     pthread_mutex_destroy(&win->write_lock);
-    win->alive = 0;
+    win->alive     = 0;
+    win->container = -1;
     GS.n_wins--;
 
     if (user_initiated && fd >= 0)
         shutdown(fd, SHUT_RDWR);
+
+    /* container bookkeeping */
+    if (ci >= 0 && ci < MAX_CONTAINERS && GS.conts[ci].alive) {
+        GsContainer *c = &GS.conts[ci];
+        int tabs[MAX_WINDOWS];
+        int n = _container_tabs(ci, tabs, MAX_WINDOWS);
+        if (n == 0) {
+            XDestroyWindow(GS.dpy, c->xwin);
+            XFreeGC(GS.dpy, c->gc);
+            c->alive = 0;
+        } else {
+            if (c->active == slot) c->active = tabs[0];   /* pick a survivor */
+            _set_container_title(c);
+            _repaint_container(c);
+        }
+    }
+}
+
+/* Close every tab in a container (user closed the whole window). The final
+ * _close_tab destroys the X window when the tab count reaches zero. */
+static void
+_close_container(int ci, int user_initiated)
+{
+    if (ci < 0 || ci >= MAX_CONTAINERS || !GS.conts[ci].alive) return;
+    int ids[MAX_WINDOWS], n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (GS.wins[i].alive && GS.wins[i].container == ci)
+            ids[n++] = GS.wins[i].id;
+    for (int k = 0; k < n; k++)
+        _close_tab(ids[k], user_initiated);
 }
 
 /* ------------------------------------------------------------------ */
@@ -422,7 +686,8 @@ _dispatch(Cmd *cmd)
     switch (cmd->type) {
 
     case CMD_NEWWIN:
-        _open_window(cmd->win_id, cmd->fd, cmd->width, cmd->height, cmd->title);
+        _open_window(cmd->win_id, cmd->fd, cmd->width, cmd->height,
+                     cmd->title, cmd->group_id);
         break;
 
     case CMD_PNG:
@@ -431,7 +696,12 @@ _dispatch(Cmd *cmd)
             if (win->surface) cairo_surface_destroy(win->surface);
             win->surface = cmd->surface;   /* takes ownership          */
             cmd->surface = NULL;
-            _repaint_window(win);
+            /* Repaint only if this tab is the visible one; a background
+             * tab just stores its surface for when it is selected.    */
+            int ci   = win->container;
+            int slot = (int)(win - GS.wins);
+            if (ci >= 0 && GS.conts[ci].alive && GS.conts[ci].active == slot)
+                _repaint_container(&GS.conts[ci]);
         } else {
             if (cmd->surface) cairo_surface_destroy(cmd->surface);
         }
@@ -441,13 +711,16 @@ _dispatch(Cmd *cmd)
         win = _find_or_create_win(cmd->win_id);
         if (win) {
             snprintf(win->title, sizeof(win->title), "%s", cmd->title);
-            XStoreName(GS.dpy, win->xwin, win->title);
-            XFlush(GS.dpy);
+            int ci = win->container;
+            if (ci >= 0 && GS.conts[ci].alive) {
+                _set_container_title(&GS.conts[ci]);
+                _repaint_container(&GS.conts[ci]);   /* tab label may show it */
+            }
         }
         break;
 
     case CMD_CLOSE:
-        _close_window(cmd->win_id, 0);   /* client asked: it closes its own fd */
+        _close_tab(cmd->win_id, 0);   /* client asked: it closes its own fd */
         break;
 
     case CMD_SAVEPATH:
@@ -494,88 +767,120 @@ _slider_send(GsWindow *win, uint8_t id, float value)
     pthread_mutex_unlock(&win->write_lock);
 }
 
-/* Pointer pressed/dragged at (x,y) within a window. If it lands on the
- * bottom (k) or right (A) slider strip, update that slider, repaint the
- * thumb, and push the new value to the client. */
+/* Pointer pressed/dragged at container-relative (ex,ey) over the active
+ * tab's body rect (bx,by,bw,bh). If it lands on the bottom (k) or right (A)
+ * slider strip, update that slider, repaint, and push the value to the tab's
+ * client. */
 static void
-_slider_input(GsWindow *win, int x, int y)
+_slider_input(GsWindow *win, int bx, int by, int bw, int bh, int ex, int ey)
 {
-    double pw = (double)win->width  - SLIDER_W;
-    double ph = (double)win->height - SLIDER_H;
+    int x = ex - bx;
+    int y = ey - by;
+    double pw = (double)bw - SLIDER_W;
+    double ph = (double)bh - SLIDER_H;
     if (pw < 20.0 || ph < 20.0) return;
+    if (x < 0 || y < 0) return;
+
+    int ci = win->container;
+    GsContainer *c = (ci >= 0 && ci < MAX_CONTAINERS) ? &GS.conts[ci] : NULL;
 
     if (y >= ph && x <= pw) {                 /* bottom strip → k (id 0) */
         double frac = _clampd(((double)x - 8.0) / (pw - 16.0), 0.0, 1.0);
         double val  = SLD_K_MIN + frac * (SLD_K_MAX - SLD_K_MIN);
         win->sld_val[0] = val;
-        _repaint_window(win);
+        if (c) _repaint_container(c);
         _slider_send(win, 0, (float)val);
     } else if (x >= pw && y <= ph) {          /* right strip → A (id 1) */
         double frac = _clampd(1.0 - ((double)y - 8.0) / (ph - 16.0), 0.0, 1.0);
         double val  = SLD_A_MIN + frac * (SLD_A_MAX - SLD_A_MIN);
         win->sld_val[1] = val;
-        _repaint_window(win);
+        if (c) _repaint_container(c);
         _slider_send(win, 1, (float)val);
     }
+}
+
+static GsContainer *_container_for_xwin(Window xw)
+{
+    for (int i = 0; i < MAX_CONTAINERS; i++)
+        if (GS.conts[i].alive && GS.conts[i].xwin == xw)
+            return &GS.conts[i];
+    return NULL;
+}
+
+/* Route a body event (button/motion) to the active tab's slider strips,
+ * unless it landed on the tab bar (handled separately). */
+static void _body_slider_event(GsContainer *c, int ex, int ey)
+{
+    int tabs[MAX_WINDOWS];
+    int n = _container_tabs((int)(c - GS.conts), tabs, MAX_WINDOWS);
+    if (n >= 2 && ey < TABBAR_H) return;            /* in the tab bar */
+    if (c->active < 0 || !GS.wins[c->active].alive) return;
+    int bx, by, bw, bh;
+    _body_geom(c, n, &bx, &by, &bw, &bh);
+    _slider_input(&GS.wins[c->active], bx, by, bw, bh, ex, ey);
 }
 
 static void
 _handle_xevent(XEvent *ev)
 {
     switch (ev->type) {
-    case Expose:
-        for (int i = 0; i < MAX_WINDOWS; i++) {
-            if (GS.wins[i].alive && GS.wins[i].xwin == ev->xexpose.window) {
-                _repaint_window(&GS.wins[i]);
-                break;
-            }
-        }
+    case Expose: {
+        GsContainer *c = _container_for_xwin(ev->xexpose.window);
+        if (c) _repaint_container(c);
         break;
+    }
 
-    case ConfigureNotify:
-        for (int i = 0; i < MAX_WINDOWS; i++) {
-            GsWindow *win = &GS.wins[i];
-            if (!win->alive || win->xwin != ev->xconfigure.window) continue;
-            win->width  = ev->xconfigure.width;
-            win->height = ev->xconfigure.height;
-            _repaint_window(win);
-            break;
+    case ConfigureNotify: {
+        GsContainer *c = _container_for_xwin(ev->xconfigure.window);
+        if (c) {
+            c->width  = ev->xconfigure.width;
+            c->height = ev->xconfigure.height;
+            _repaint_container(c);
         }
         break;
+    }
 
     case ClientMessage:
         if ((Atom)ev->xclient.data.l[0] == GS.wm_delete) {
-            /* User closed a window — mark dead and signal an interactive
-             * client (EOF) so its run loop returns instead of blocking. */
-            for (int i = 0; i < MAX_WINDOWS; i++) {
-                if (GS.wins[i].alive && GS.wins[i].xwin == ev->xclient.window) {
-                    _close_window(GS.wins[i].id, 1);
-                    break;
-                }
-            }
+            /* User closed the whole window — close every tab in it and signal
+             * each interactive client (EOF) so its run loop returns. */
+            GsContainer *c = _container_for_xwin(ev->xclient.window);
+            if (c) _close_container((int)(c - GS.conts), 1);
         }
         break;
 
     case ButtonPress:
         if (ev->xbutton.button == Button1) {
-            for (int i = 0; i < MAX_WINDOWS; i++) {
-                if (GS.wins[i].alive && GS.wins[i].xwin == ev->xbutton.window) {
-                    _slider_input(&GS.wins[i], ev->xbutton.x, ev->xbutton.y);
-                    break;
+            GsContainer *c = _container_for_xwin(ev->xbutton.window);
+            if (!c) break;
+            int tabs[MAX_WINDOWS];
+            int n = _container_tabs((int)(c - GS.conts), tabs, MAX_WINDOWS);
+            if (n >= 2 && ev->xbutton.y < TABBAR_H) {
+                int want_close = 0;
+                int slot = _tabbar_hit(c, tabs, n, ev->xbutton.x,
+                                       ev->xbutton.y, &want_close);
+                if (slot >= 0) {
+                    if (want_close) {
+                        /* per-tab close = user discard → signal client EOF */
+                        _close_tab(GS.wins[slot].id, 1);
+                    } else if (slot != c->active) {
+                        c->active = slot;
+                        _set_container_title(c);
+                        _repaint_container(c);
+                    }
                 }
+                break;
             }
+            _body_slider_event(c, ev->xbutton.x, ev->xbutton.y);
         }
         break;
 
-    case MotionNotify:
+    case MotionNotify: {
         /* Button1MotionMask ⇒ only delivered while button 1 is held. */
-        for (int i = 0; i < MAX_WINDOWS; i++) {
-            if (GS.wins[i].alive && GS.wins[i].xwin == ev->xmotion.window) {
-                _slider_input(&GS.wins[i], ev->xmotion.x, ev->xmotion.y);
-                break;
-            }
-        }
+        GsContainer *c = _container_for_xwin(ev->xmotion.window);
+        if (c) _body_slider_event(c, ev->xmotion.x, ev->xmotion.y);
         break;
+    }
 
     default:
         break;
@@ -606,6 +911,17 @@ _connection_thread(void *arg)
      * so the window's real slot kept client_fd == -1 and close/reverse
      * sends silently no-op'd. */
 
+    /* Tab-grouping key: the connecting client's PID via SO_PEERCRED (the
+     * Linux equivalent of Cocoa's LOCAL_PEERPID). All windows opened by the
+     * same process land in one tab group. Unavailable → 0 (standalone). */
+    uint32_t peer_pid = 0;
+    {
+        struct ucred uc;
+        socklen_t ul = sizeof(uc);
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &uc, &ul) == 0 && uc.pid > 0)
+            peer_pid = (uint32_t)uc.pid;
+    }
+
     uint32_t seq_out = 0;
 
     for (;;) {
@@ -635,6 +951,7 @@ _connection_thread(void *arg)
             cmd->type   = CMD_NEWWIN;
             cmd->win_id = wid;
             cmd->fd     = fd;          /* wire client_fd to THIS window's slot */
+            cmd->group_id = peer_pid;  /* tab group (same client PID = tabs)   */
             if (len >= sizeof(gsp_newwin_t)) {
                 gsp_newwin_t nw;
                 memcpy(&nw, payload, sizeof(nw));
