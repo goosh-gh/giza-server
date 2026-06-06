@@ -62,13 +62,17 @@ which picks GTK on Linux and Cocoa on macOS).  Override with:
 ./configure --with-viewer=cocoa    # macOS Cocoa
 ```
 
-**Feature parity.** The interactive features — `SLIDER` reverse channel,
-`File ▸ Save` (PNG / reverse-channel PDF/SVG), per-PID tab grouping, and
-close-signals-the-client lifecycle — live in the **Cocoa** (macOS) and
-**Xlib** (Linux) viewers. The **GTK** viewer is the original display-only
-backend (PNG frames, titles, persistence); it does not implement sliders,
-save, or tabs. On Linux, prefer `--with-viewer=xlib` for the full feature
-set; GTK remains for environments already standardized on it.
+**Feature parity.** The **Cocoa** (macOS) viewer implements the full
+interactive set: `SLIDER` reverse channel, `File ▸ Save` (PNG and
+reverse-channel PDF/SVG), per-PID tab grouping, and the
+close-signals-the-client lifecycle. The **Xlib** (Linux) viewer implements
+the `SLIDER` reverse channel (a bottom strip drives slider id 0 = k, a right
+strip drives id 1 = A; dragging sends the value to the client) and the
+close-signals-the-client lifecycle; vector `File ▸ Save` and tab grouping are
+not yet wired on Xlib. The **GTK** viewer is the original display-only backend
+(PNG frames, titles, persistence) — no sliders, save, or tabs. On Linux,
+prefer `--with-viewer=xlib`; the default `./configure` auto-detects **GTK**,
+so build Xlib explicitly if you want the interactive sliders.
 
 ## Architecture
 

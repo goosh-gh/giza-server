@@ -57,6 +57,18 @@
 #define MAX_WINDOWS     64
 #define MAX_TITLE_LEN   255
 
+/* Interactive sliders (viewer-side fixed controls, mirroring the Cocoa
+ * backend): a horizontal strip at the bottom drives slider id 0 (freq k)
+ * and a vertical strip at the right drives id 1 (amplitude A). Moving one
+ * sends GSP_MSG_SLIDER(id, value) back to the window's client. */
+#define SLIDER_H        28          /* bottom strip height (horizontal, id 0) */
+#define SLIDER_W        28          /* right  strip width  (vertical,   id 1) */
+#define SLD_K_MIN       0.5         /* id 0 (k) range — matches Cocoa */
+#define SLD_K_MAX       8.0
+#define SLD_A_MIN       0.1         /* id 1 (A) range — matches Cocoa */
+#define SLD_A_MAX       1.0
+#define TWO_PI          6.283185307179586
+
 /* ------------------------------------------------------------------ */
 /* Thread-safe wakeup pipe: connection threads poke the X event loop  */
 /* ------------------------------------------------------------------ */
@@ -128,6 +140,9 @@ typedef struct {
 
     /* Pipe: main thread → connection thread (for SAVEREQ)            */
     int              savereq_wr;   /* write end; -1 if unused           */
+
+    /* Interactive slider values (main-thread only). [0]=k, [1]=A.      */
+    double           sld_val[2];
 } GsWindow;
 
 /* ------------------------------------------------------------------ */
@@ -209,6 +224,27 @@ _send_hdr(int fd, uint8_t type, uint32_t len, uint32_t seq)
     return _write_exact(fd, &h, sizeof(h));
 }
 
+/* Same as _send_hdr, but serialized by the target window's write_lock so a
+ * server→client frame from the connection thread (e.g. PNG ACK) is never
+ * interleaved with a SLIDER frame sent from the main X thread on the same
+ * fd. Falls back to an unlocked send when the window does not exist yet
+ * (NEWWIN ACK / PONG happen before/at window creation, with no concurrent
+ * slider traffic). */
+static int
+_send_hdr_locked(int wid, int fd, uint8_t type, uint32_t len, uint32_t seq)
+{
+    GsWindow *win = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        if (GS.wins[i].alive && GS.wins[i].id == wid) { win = &GS.wins[i]; break; }
+
+    if (!win) return _send_hdr(fd, type, len, seq);
+
+    pthread_mutex_lock(&win->write_lock);
+    int r = _send_hdr(fd, type, len, seq);
+    pthread_mutex_unlock(&win->write_lock);
+    return r;
+}
+
 /* ------------------------------------------------------------------ */
 /* Window management (main-thread only)                                */
 /* ------------------------------------------------------------------ */
@@ -237,6 +273,8 @@ _open_window(int id, int client_fd, int w, int h, const char *title)
         win->client_fd  = client_fd;   /* this window's own client socket */
         win->savereq_wr = -1;
         pthread_mutex_init(&win->write_lock, NULL);
+        win->sld_val[0] = 1.0;   /* k initial (matches Cocoa) */
+        win->sld_val[1] = 1.0;   /* A initial                 */
         snprintf(win->title, sizeof(win->title), "%s", title[0] ? title : "giza");
 
         win->xwin = XCreateSimpleWindow(
@@ -249,12 +287,60 @@ _open_window(int id, int client_fd, int w, int h, const char *title)
         XStoreName(GS.dpy, win->xwin, win->title);
         XSetWMProtocols(GS.dpy, win->xwin, &GS.wm_delete, 1);
         win->gc = XCreateGC(GS.dpy, win->xwin, 0, NULL);
-        XSelectInput(GS.dpy, win->xwin, ExposureMask | StructureNotifyMask);
+        XSelectInput(GS.dpy, win->xwin,
+                     ExposureMask | StructureNotifyMask |
+                     ButtonPressMask | Button1MotionMask);
         XMapRaised(GS.dpy, win->xwin);
         GS.n_wins++;
         return;
     }
     fprintf(stderr, "giza_server: too many windows (max %d)\n", MAX_WINDOWS);
+}
+
+static double _clampd(double v, double lo, double hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* Draw the two slider strips (bottom = k, right = A) with their thumbs,
+ * over the painted plot. Called from _repaint_window with a live cairo_t
+ * on the window's xlib surface. */
+static void
+_draw_sliders(cairo_t *cr, GsWindow *win)
+{
+    double pw = (double)win->width  - SLIDER_W;   /* plot-area width  */
+    double ph = (double)win->height - SLIDER_H;   /* plot-area height */
+    if (pw < 20.0 || ph < 20.0) return;
+
+    /* strip backgrounds */
+    cairo_set_source_rgb(cr, 0.88, 0.88, 0.88);
+    cairo_rectangle(cr, 0.0, ph, (double)win->width,  (double)SLIDER_H);
+    cairo_rectangle(cr, pw,  0.0, (double)SLIDER_W,    (double)win->height);
+    cairo_fill(cr);
+
+    cairo_set_line_width(cr, 2.0);
+
+    /* horizontal slider (id 0 = k): track + thumb */
+    double cyh = ph + SLIDER_H / 2.0;
+    cairo_set_source_rgb(cr, 0.45, 0.45, 0.45);
+    cairo_move_to(cr, 8.0, cyh);
+    cairo_line_to(cr, pw - 8.0, cyh);
+    cairo_stroke(cr);
+    double kf = (win->sld_val[0] - SLD_K_MIN) / (SLD_K_MAX - SLD_K_MIN);
+    cairo_set_source_rgb(cr, 0.20, 0.40, 0.80);
+    cairo_arc(cr, 8.0 + kf * (pw - 16.0), cyh, 7.0, 0.0, TWO_PI);
+    cairo_fill(cr);
+
+    /* vertical slider (id 1 = A): track + thumb (min bottom, max top) */
+    double cxv = pw + SLIDER_W / 2.0;
+    cairo_set_source_rgb(cr, 0.45, 0.45, 0.45);
+    cairo_move_to(cr, cxv, 8.0);
+    cairo_line_to(cr, cxv, ph - 8.0);
+    cairo_stroke(cr);
+    double af = (win->sld_val[1] - SLD_A_MIN) / (SLD_A_MAX - SLD_A_MIN);
+    cairo_set_source_rgb(cr, 0.20, 0.40, 0.80);
+    cairo_arc(cr, cxv, 8.0 + (1.0 - af) * (ph - 16.0), 7.0, 0.0, TWO_PI);
+    cairo_fill(cr);
 }
 
 static void
@@ -273,6 +359,7 @@ _repaint_window(GsWindow *win)
     cairo_t *cr = cairo_create(xsurf);
     cairo_set_source_surface(cr, win->surface, 0, 0);
     cairo_paint(cr);
+    _draw_sliders(cr, win);
     cairo_destroy(cr);
     cairo_surface_destroy(xsurf);
     XFlush(GS.dpy);
@@ -385,6 +472,53 @@ _dispatch(Cmd *cmd)
 /* X event handler (main thread)                                       */
 /* ------------------------------------------------------------------ */
 
+/* Send GSP_MSG_SLIDER(id, value) to this window's client. Serialized by
+ * write_lock so the 16-byte header + 5-byte payload are not interleaved
+ * with the connection thread's ACK/PONG writes on the same fd. No-op if
+ * the client has exited (client_fd == -1), which is the case for plain
+ * show() windows. */
+static void
+_slider_send(GsWindow *win, uint8_t id, float value)
+{
+    if (!win) return;
+    pthread_mutex_lock(&win->write_lock);
+    int fd = win->client_fd;
+    if (fd >= 0) {
+        gsp_slider_t body;
+        memset(&body, 0, sizeof(body));
+        body.slider_id = id;
+        body.value     = value;
+        if (_send_hdr(fd, GSP_MSG_SLIDER, (uint32_t)sizeof(body), 0) == 0)
+            _write_exact(fd, &body, sizeof(body));
+    }
+    pthread_mutex_unlock(&win->write_lock);
+}
+
+/* Pointer pressed/dragged at (x,y) within a window. If it lands on the
+ * bottom (k) or right (A) slider strip, update that slider, repaint the
+ * thumb, and push the new value to the client. */
+static void
+_slider_input(GsWindow *win, int x, int y)
+{
+    double pw = (double)win->width  - SLIDER_W;
+    double ph = (double)win->height - SLIDER_H;
+    if (pw < 20.0 || ph < 20.0) return;
+
+    if (y >= ph && x <= pw) {                 /* bottom strip → k (id 0) */
+        double frac = _clampd(((double)x - 8.0) / (pw - 16.0), 0.0, 1.0);
+        double val  = SLD_K_MIN + frac * (SLD_K_MAX - SLD_K_MIN);
+        win->sld_val[0] = val;
+        _repaint_window(win);
+        _slider_send(win, 0, (float)val);
+    } else if (x >= pw && y <= ph) {          /* right strip → A (id 1) */
+        double frac = _clampd(1.0 - ((double)y - 8.0) / (ph - 16.0), 0.0, 1.0);
+        double val  = SLD_A_MIN + frac * (SLD_A_MAX - SLD_A_MIN);
+        win->sld_val[1] = val;
+        _repaint_window(win);
+        _slider_send(win, 1, (float)val);
+    }
+}
+
 static void
 _handle_xevent(XEvent *ev)
 {
@@ -418,6 +552,27 @@ _handle_xevent(XEvent *ev)
                     _close_window(GS.wins[i].id, 1);
                     break;
                 }
+            }
+        }
+        break;
+
+    case ButtonPress:
+        if (ev->xbutton.button == Button1) {
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                if (GS.wins[i].alive && GS.wins[i].xwin == ev->xbutton.window) {
+                    _slider_input(&GS.wins[i], ev->xbutton.x, ev->xbutton.y);
+                    break;
+                }
+            }
+        }
+        break;
+
+    case MotionNotify:
+        /* Button1MotionMask ⇒ only delivered while button 1 is held. */
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            if (GS.wins[i].alive && GS.wins[i].xwin == ev->xmotion.window) {
+                _slider_input(&GS.wins[i], ev->xmotion.x, ev->xmotion.y);
+                break;
             }
         }
         break;
@@ -495,7 +650,7 @@ _connection_thread(void *arg)
             cairo_surface_t *surf = _decode_png(payload, len);
             if (!surf || cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
                 if (surf) cairo_surface_destroy(surf);
-                _send_hdr(fd, GSP_MSG_ERR, 0, seq_out++);
+                _send_hdr_locked(wid, fd, GSP_MSG_ERR, 0, seq_out++);
                 break;
             }
             Cmd *cmd = calloc(1, sizeof(Cmd));
@@ -504,7 +659,7 @@ _connection_thread(void *arg)
             cmd->win_id  = wid;
             cmd->surface = surf;
             _send_cmd(cmd);
-            _send_hdr(fd, GSP_MSG_ACK, 0, seq_out++);
+            _send_hdr_locked(wid, fd, GSP_MSG_ACK, 0, seq_out++);
             break;
         }
 
