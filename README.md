@@ -16,7 +16,7 @@ In PGPLOT, `pgxwin_server` kept plot windows alive after the calling program exi
 | WSL2 / Wayland | No | Yes (no X atoms needed) |
 | macOS native | No | Yes (NSWindow/NSView, v0.2+) |
 
-The calling program opens the device `/GS`, renders frames as PNG into the server
+The calling program opens the device `/gs`, renders frames as PNG into the server
 via a lightweight binary protocol over a Unix-domain socket, and exits.  The server
 window stays open until the user closes it.
 
@@ -57,17 +57,25 @@ The backend is detected automatically at configure time (`--with-viewer=auto`,
 which picks GTK on Linux and Cocoa on macOS).  Override with:
 
 ```bash
-./configure --with-viewer=gtk      # GTK 3 (Linux, default)
+./configure --with-viewer=gtk      # GTK 3 (Linux)
 ./configure --with-viewer=xlib     # Xlib only — no GTK/GLib/GIO required
 ./configure --with-viewer=cocoa    # macOS Cocoa
 ```
+
+**Feature parity.** The interactive features — `SLIDER` reverse channel,
+`File ▸ Save` (PNG / reverse-channel PDF/SVG), per-PID tab grouping, and
+close-signals-the-client lifecycle — live in the **Cocoa** (macOS) and
+**Xlib** (Linux) viewers. The **GTK** viewer is the original display-only
+backend (PNG frames, titles, persistence); it does not implement sliders,
+save, or tabs. On Linux, prefer `--with-viewer=xlib` for the full feature
+set; GTK remains for environments already standardized on it.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────┐      Unix socket         ┌─────────────────────────┐
 │  Your program               │  ──────────────────────► │  giza-server            │
-│  (giza /GS driver)          │   GSP wire protocol      │  Linux:  GTK 3 or Xlib viewer   │
+│  (giza /gs driver)          │   GSP wire protocol      │  Linux:  GTK 3 or Xlib viewer   │
 │                             │   PNG frames, titles,    │  macOS:  Cocoa viewer   │
 │  giza → Cairo PNG surface   │   NEWWIN / CLOSE msgs    │                         │
 └─────────────────────────────┘                          │  persistent window(s)   │
@@ -82,7 +90,8 @@ which picks GTK on Linux and Cocoa on macOS).  Override with:
 typedef struct {
     uint32_t magic;    /* 0x47495A41 "GIZA" */
     uint8_t  version;
-    uint8_t  type;     /* PNG, NEWWIN, CLOSE, PING/PONG, TITLE, SLIDER ... */
+    uint8_t  type;     /* PNG, NEWWIN, CLOSE, PING/PONG, TITLE, SLIDER,
+                          SAVEREQ, SAVEDATA ... */
     uint16_t flags;
     uint32_t length;   /* payload bytes */
     uint32_t seq;
@@ -97,9 +106,18 @@ typedef struct {
 | `TITLE` | client→server | **none** (fire-and-forget) |
 | `CLOSE` | client→server | ACK |
 | `SLIDER` | server→client | **none** (fire-and-forget) |
+| `SAVEREQ` | server→client | **none** (reverse-channel save request) |
+| `SAVEDATA` | client→server | **none** (rendered vector bytes) |
 
 `SLIDER` carries a 5-byte packed `gsp_slider_t` payload (`uint8_t` slider id
 + `float` value), letting one message type drive any number of sliders.
+
+`SAVEREQ`/`SAVEDATA` implement the **reverse-channel vector save**: when the
+user picks *Save as PDF/SVG* in the viewer, the server sends `SAVEREQ(fmt)`
+to the still-running client, which re-renders the current figure to the
+requested vector format and returns the bytes as `SAVEDATA`. Raster *Save as
+PNG* needs no round-trip — the viewer holds the last received PNG and writes
+it directly.
 
 ## Build
 
@@ -163,8 +181,8 @@ lives under `/opt/local`. Use the Xcode `clang` and the MacPorts
 Force a specific backend:
 
 ```bash
-./configure --with-viewer=gtk      # GTK 3 (Linux, default)
-./configure --with-viewer=xlib     # Xlib only (Linux)
+./configure --with-viewer=gtk      # GTK 3 (Linux, display-only)
+./configure --with-viewer=xlib     # Xlib only (Linux, full features)
 ./configure --with-viewer=cocoa    # macOS Cocoa
 ```
 
@@ -223,8 +241,10 @@ follows the same pattern as the giza `/osx` driver (PR #86):
 
 - PNG frames are decoded as `NSImage` from `NSData` in memory (no temp files).
 
-- Windows share a common `tabbingIdentifier` so macOS tab-groups them
-  automatically (same trick as `PDL::Graphics::Cairo`'s `pdlcairo_viewer`).
+- Windows opened by the same client process are tab-grouped: they share a
+  per-PID `tabbingIdentifier` and are inserted explicitly with
+  `addTabbedWindow:ordered:` so creation order (1, 2, 3) is preserved
+  regardless of the user's "prefer tabs" system setting.
 
 - `GSP_MSG_TITLE` is fire-and-forget on both backends — **no ACK**.
 
@@ -235,11 +255,21 @@ follows the same pattern as the giza `/osx` driver (PR #86):
   thread, every write to one fd is serialized through a per-window
   `write_lock` (`_send_msg_locked`).
 
-- **Lifetime & quit.** The app stays alive after a client exits (the
-  `pgxwin_server` persistence role) via `disableAutomaticTermination`;
-  explicit quit (⌘Q or the **Quit** menu item) is honored because
-  `applicationShouldTerminate:` returns `NSTerminateNow`. A `File` menu is
-  present as a stub for future *Save as PDF / SVG*.
+- **Lifetime, close & quit.** The app stays alive after a client exits (the
+  `pgxwin_server` persistence role) via `disableAutomaticTermination`.
+  Closing a window (red button) is an explicit discard: the slot is
+  invalidated and, when it was the last live window on that client's socket,
+  the server `shutdown()`s the socket so an *interactive* client (one in a
+  `show_interactive` run loop) receives EOF and returns — no ⌘Q needed.
+  Explicit quit (⌘Q or the **Quit** menu item) is honored because
+  `applicationShouldTerminate:` returns `NSTerminateNow`.
+
+- **File ▸ Save.** *Save as PNG* writes the last received frame straight from
+  the in-memory buffer (works even after the client has exited). *Save as
+  PDF* / *Save as SVG* use the `SAVEREQ`/`SAVEDATA` reverse channel to have
+  the live client re-render true vector output. For a client-absent window the
+  vector items gray out (`validateMenuItem:`), since there is no client left
+  to re-render; PNG stays enabled.
 
 ## Files
 
