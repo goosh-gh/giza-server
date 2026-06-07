@@ -40,6 +40,9 @@ and the Perl `Driver::GS` backend display correctly in native windows.
 Bidirectional control is also verified on macOS: native sliders in the
 viewer send their values back to the client (server→client `SLIDER`), which
 recomputes the plot and pushes a new frame live — see **Examples** below.
+Resizing an interactive window likewise replots at the new size over the
+server→client `RESIZE` channel, so the figure is re-laid-out rather than
+bitmap-scaled.
 
 ## Backends
 
@@ -64,14 +67,17 @@ which picks GTK on Linux and Cocoa on macOS).  Override with:
 
 **Feature parity.** The **Cocoa** (macOS) viewer implements the full
 interactive set: `SLIDER` reverse channel, `File ▸ Save` (PNG and
-reverse-channel PDF/SVG), per-PID tab grouping, and the
-close-signals-the-client lifecycle. The **Xlib** (Linux) viewer implements
+reverse-channel PDF/SVG), `RESIZE` resize replot (re-renders an interactive
+window's figure at the new size on resize, rather than bitmap-scaling),
+per-PID tab grouping, and the close-signals-the-client lifecycle. The
+**Xlib** (Linux) viewer implements
 the `SLIDER` reverse channel (a bottom strip drives slider id 0 = k, a right
 strip drives id 1 = A; dragging sends the value to the client), per-PID tab
 grouping (figures from the same client process share one window with a
 cairo-drawn tab bar — click to switch, per-tab `×` to close, WM-close discards
-the whole group), and the close-signals-the-client lifecycle; only vector
-`File ▸ Save` is not yet wired on Xlib. (Xlib tab order currently follows
+the whole group), and the close-signals-the-client lifecycle; vector
+`File ▸ Save` and `RESIZE` resize replot are not yet wired on Xlib. (Xlib tab
+order currently follows
 internal slot allocation, so reopening a tab after closing one may not
 preserve creation order — a known minor quirk; Cocoa preserves it.) The
 **GTK** viewer is the original display-only backend (PNG frames, titles,
@@ -100,7 +106,7 @@ typedef struct {
     uint32_t magic;    /* 0x47495A41 "GIZA" */
     uint8_t  version;
     uint8_t  type;     /* PNG, NEWWIN, CLOSE, PING/PONG, TITLE, SLIDER,
-                          SAVEREQ, SAVEDATA ... */
+                          SAVEREQ, SAVEDATA, RESIZE ... */
     uint16_t flags;
     uint32_t length;   /* payload bytes */
     uint32_t seq;
@@ -117,6 +123,7 @@ typedef struct {
 | `SLIDER` | server→client | **none** (fire-and-forget) |
 | `SAVEREQ` | server→client | **none** (reverse-channel save request) |
 | `SAVEDATA` | client→server | **none** (rendered vector bytes) |
+| `RESIZE` | server→client | **none** (reverse-channel resize replot) |
 
 `SLIDER` carries a 5-byte packed `gsp_slider_t` payload (`uint8_t` slider id
 + `float` value), letting one message type drive any number of sliders.
@@ -127,6 +134,15 @@ to the still-running client, which re-renders the current figure to the
 requested vector format and returns the bytes as `SAVEDATA`. Raster *Save as
 PNG* needs no round-trip — the viewer holds the last received PNG and writes
 it directly.
+
+`RESIZE` implements **resize replot**: when the user resizes a window whose
+client is still alive (an interactive session), the viewer coalesces the
+live-drag burst and, once it settles, sends `RESIZE(width_px, height_px)`
+(an 8-byte packed `gsp_resize_t`). The client re-renders its current figure
+at the new size and pushes it back through the normal `PNG` path, so the plot
+is re-laid-out for the new geometry instead of being bitmap-scaled. A
+client-absent window (a plain `show()` window after its script exited) gets no
+`RESIZE` — the viewer just letterbox-scales its last frame.
 
 ## Build
 

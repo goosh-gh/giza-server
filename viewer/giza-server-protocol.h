@@ -74,6 +74,7 @@ gsp_resolve_sock_path(char *buf, size_t n)
 #define GSP_MSG_SLIDER  0x13u  /* server → client: slider value (float)*/
 #define GSP_MSG_SAVEREQ 0x14u  /* server → client: render & return vector (PDF/SVG) */
 #define GSP_MSG_SAVEDATA 0x15u /* client → server: vector bytes for a pending save   */
+#define GSP_MSG_RESIZE  0x16u  /* server → client: window resized, re-render at new px */
 #define GSP_MSG_CLOSE   0x20u  /* client → server: close this window   */
 #define GSP_MSG_ACK     0x21u  /* server → client: acknowledged        */
 #define GSP_MSG_ERR     0xFFu  /* server → client: error (+ message)   */
@@ -103,6 +104,21 @@ gsp_resolve_sock_path(char *buf, size_t n)
  *   bytes to the path the user chose in the save panel.  The server
  *   remembers (path, fmt) per window between SAVEREQ and SAVEDATA, so
  *   the client never needs to know the destination path.
+ */
+
+/* GSP_MSG_RESIZE payload:
+ *   uint32_t width_px    (new plot-canvas width  in pixels)
+ *   uint32_t height_px   (new plot-canvas height in pixels)
+ *   server → client, fire-and-forget (no ACK).  Sent ONLY for a window
+ *   whose client is still alive (show_interactive), after the user
+ *   resizes it.  The viewer coalesces the live-drag burst and emits one
+ *   RESIZE once the drag settles; it also suppresses no-op resizes
+ *   (window moved, not resized) and duplicate final sizes.  The client
+ *   re-renders its current figure at the new size and returns it through
+ *   the normal GSP_MSG_PNG path (which the server ACKs as usual).  A
+ *   client-absent window (a plain show() window after its script exited)
+ *   gets no RESIZE — the viewer just letterbox-scales its last PNG.
+ *   Total payload: 8 bytes.
  */
 
 /* ------------------------------------------------------------------ */
@@ -155,6 +171,11 @@ typedef struct __attribute__((packed)) {
     uint8_t  slider_id;
     float    value;
 } gsp_slider_t;   /* 5 bytes */
+
+typedef struct __attribute__((packed)) {
+    uint32_t width_px;
+    uint32_t height_px;
+} gsp_resize_t;   /* 8 bytes */
 
 /* ------------------------------------------------------------------ */
 /* Timeouts & limits                                                   */

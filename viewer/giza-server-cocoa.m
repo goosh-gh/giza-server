@@ -76,6 +76,13 @@
 #include "giza-server-protocol.h"
 static void _slider_send(int win_id, uint8_t slider_id, float value);
 static void _savereq_send(int win_id, uint8_t fmt);
+static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px);
+
+/* Live-drag fires windowDidResize: continuously; coalesce the burst and
+ * emit one RESIZE this long after the last event (drag settled). Each
+ * RESIZE triggers a full client re-render + PNG round-trip, so we never
+ * want to fire per intermediate frame. */
+#define GS_RESIZE_DEBOUNCE_SEC 0.06
 
 /* ------------------------------------------------------------------ */
 /* GsView - custom NSView that letterbox-scales the current NSImage    */
@@ -206,6 +213,8 @@ typedef struct {
     uint32_t   group_id;          /* tab group (client PID); 0 = ungrouped */
     uint32_t   seq_out;           /* seq for SLIDER messages we send    */
     pthread_mutex_t write_lock;   /* serialize writes to client_fd      */
+    uint32_t   last_sent_w;       /* last RESIZE px emitted (suppress dup/no-op moves) */
+    uint32_t   last_sent_h;       /*   touched on main thread only       */
     NSData         *last_png;     /* latest page PNG (owned copy, for saving) */
     char           *save_path;    /* pending vector-save destination (malloc'd, NULL if none) */
     uint8_t         save_fmt;     /* GSP_SAVE_FMT_* for the pending save  */
@@ -240,6 +249,7 @@ static struct {
 - (void)saveSVG:(id)sender;
 - (void)_vectorSave:(NSString *)fmt;
 - (void)_vectorSaveExited:(NSString *)fmt view:(GsView *)view;
+- (void)_emitResize:(NSNumber *)boxedWinId;
 @end
 
 @implementation GsAppDelegate (FileSave)
@@ -464,6 +474,52 @@ static BOOL _gsview_is_live(GsView *v)
 - (void)saveSVG:(id)sender { (void)sender; [self _vectorSave:@"SVG"]; }
 
 /* ---- NSWindowDelegate ---- */
+/* Window resized by the user. For a connected window (show_interactive)
+ * we ask the client to re-render at the new canvas size so the plot is
+ * laid out for the new geometry instead of being letterbox-scaled. The
+ * live drag fires this continuously, so we coalesce: (re)arm a short
+ * timer keyed by win_id and only emit once the drag settles.
+ *
+ * Client-absent windows (a plain show() window after its script exited)
+ * are left alone — drawRect: scales their last PNG, which is all we can
+ * do without a client to re-render. */
+- (void)windowDidResize:(NSNotification *)note
+{
+    NSWindow *win = [note object];
+    GsView   *v   = _gsview_in(win);
+    if (!_gsview_is_live(v)) return;            /* closed / stale slot */
+    if (GS.wins[v->win_id].client_fd < 0) return;  /* nobody to re-render */
+
+    /* NSNumbers of equal value are isEqual:, so cancel matches the
+     * previously-scheduled fire even though it is a different instance. */
+    NSNumber *boxed = [NSNumber numberWithInt:v->win_id];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(_emitResize:)
+                                               object:boxed];
+    [self performSelector:@selector(_emitResize:)
+               withObject:boxed
+               afterDelay:GS_RESIZE_DEBOUNCE_SEC];
+}
+
+/* Fired once the resize drag settles (main thread). Read the plot view's
+ * settled size and send RESIZE. Size is in points, matching how the
+ * initial NEWWIN size is treated, so fonts/margins stay consistent
+ * between the first frame and every resize. */
+- (void)_emitResize:(NSNumber *)boxedWinId
+{
+    int id = [boxedWinId intValue];
+    if (id < 0 || id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[id];
+    if (!w->alive || w->client_fd < 0 || w->view == nil) return;
+
+    NSSize   sz = [w->view bounds].size;
+    uint32_t pw = (uint32_t)(sz.width  + 0.5);
+    uint32_t ph = (uint32_t)(sz.height + 0.5);
+    if (pw == 0 || ph == 0) return;
+
+    _resize_send(id, pw, ph);
+}
+
 /* Red-button close = explicit discard by the user. Logically invalidate
  * the slot: alive=0 / window=nil / view=nil / free last_png / client_fd=-1.
  * n_wins is NOT decremented (array index == win_id must stay stable, so
@@ -942,6 +998,34 @@ static void _savereq_send(int win_id, uint8_t fmt)
     pthread_mutex_lock(&w->write_lock);
     if (w->client_fd >= 0)
         _send_msg(w->client_fd, GSP_MSG_SAVEREQ, w->seq_out++, &fmt, 1);
+    pthread_mutex_unlock(&w->write_lock);
+}
+
+/* Tell the live client of `win_id` its window was resized to (w,h) px so
+ * it can re-render at the new geometry. Same fd discipline as
+ * _slider_send: serialized with the ACK path through write_lock, and a
+ * no-op if the client has gone. last_sent_* suppresses duplicate final
+ * sizes and pure window moves; it is touched only on the main thread
+ * (windowDidResize:/_emitResize:), so the unlocked read is race-free. */
+static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive || w->client_fd < 0) return;
+    if (width_px == w->last_sent_w && height_px == w->last_sent_h) return;
+
+    gsp_resize_t body;
+    body.width_px  = width_px;
+    body.height_px = height_px;
+    pthread_mutex_lock(&w->write_lock);
+    /* Re-check under write_lock: disconnect teardown / windowWillClose:
+     * flip client_fd to -1 under the same lock. */
+    if (w->client_fd >= 0 &&
+        _send_msg(w->client_fd, GSP_MSG_RESIZE, w->seq_out++,
+                  &body, sizeof(body)) == 0) {
+        w->last_sent_w = width_px;
+        w->last_sent_h = height_px;
+    }
     pthread_mutex_unlock(&w->write_lock);
 }
 
