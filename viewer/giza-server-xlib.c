@@ -140,6 +140,7 @@ typedef struct {
     cairo_surface_t *surface;   /* current Cairo surface (IMAGE type)  */
     char             title[MAX_TITLE_LEN + 1];
     int              alive;     /* 0 once closed                        */
+    unsigned long    tab_seq;   /* monotonic creation order (tab sort key) */
 
     /* Server8: reverse-channel vector save.
      * Written from connection thread (under write_lock), read from main. */
@@ -187,6 +188,11 @@ static void _repaint_container(GsContainer *c);
 static void _set_container_title(GsContainer *c);
 static int  _container_tabs(int ci, int *out, int max);
 static void _close_tab(int id, int user_initiated);
+
+/* Monotonic creation counter for tab ordering. Assigned in _open_window,
+ * which runs only on the main X thread, so no lock is needed. Starts at 1
+ * so a zeroed (never-opened) slot's tab_seq (0) always sorts first/oldest. */
+static unsigned long g_tab_seq = 1;
 
 /* ------------------------------------------------------------------ */
 /* Cairo PNG-from-memory                                               */
@@ -298,6 +304,23 @@ static int _container_tabs(int ci, int *out, int max)
     for (int i = 0; i < MAX_WINDOWS && n < max; i++)
         if (GS.wins[i].alive && GS.wins[i].container == ci)
             out[n++] = i;
+    /* Order by creation sequence, not slot index: _open_window reuses freed
+     * slots, so raw slot order would drop a reopened tab into the hole left
+     * by a closed one (the "reopen scrambles order" quirk). tab_seq is
+     * monotonic; insertion-sort by it restores creation order. n is small
+     * (tabs in one container), so insertion sort is fine. This is the single
+     * tab collector, so every consumer (repaint, tab bar, hit-test, survivor
+     * pick) sees the same order. */
+    for (int a = 1; a < n; a++) {
+        int           v   = out[a];
+        unsigned long key = GS.wins[v].tab_seq;
+        int           b   = a - 1;
+        while (b >= 0 && GS.wins[out[b]].tab_seq > key) {
+            out[b + 1] = out[b];
+            b--;
+        }
+        out[b + 1] = v;
+    }
     return n;
 }
 
@@ -383,6 +406,7 @@ _open_window(int id, int client_fd, int w, int h, const char *title,
     win->id        = id;
     win->container = ci;
     win->alive     = 1;
+    win->tab_seq   = g_tab_seq++;  /* creation order, survives slot reuse */
     win->client_fd  = client_fd;   /* this tab's own client socket */
     win->savereq_wr = -1;
     pthread_mutex_init(&win->write_lock, NULL);

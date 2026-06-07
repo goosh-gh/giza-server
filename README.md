@@ -76,10 +76,7 @@ strip drives id 1 = A; dragging sends the value to the client), per-PID tab
 grouping (figures from the same client process share one window with a
 cairo-drawn tab bar — click to switch, per-tab `×` to close, WM-close discards
 the whole group), and the close-signals-the-client lifecycle; vector
-`File ▸ Save` and `RESIZE` resize replot are not yet wired on Xlib. (Xlib tab
-order currently follows
-internal slot allocation, so reopening a tab after closing one may not
-preserve creation order — a known minor quirk; Cocoa preserves it.) The
+`File ▸ Save` and `RESIZE` resize replot are not yet wired on Xlib. The
 **GTK** viewer is the original display-only backend (PNG frames, titles,
 persistence) — no sliders, save, or tabs. On Linux, prefer
 `--with-viewer=xlib`; the default `./configure` auto-detects **GTK**, so build
