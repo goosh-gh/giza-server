@@ -100,7 +100,8 @@ EXTRA_DIST = \
     giza-gs-driver.patch.annotation \
     test/test_ping.sh \
     test/test_png.sh \
-    README.md
+    README.md \
+    CHANGES.md
 
 # ------------------------------------------------------------------ #
 # check-driver: syntax-check the libgiza driver (optional)           #

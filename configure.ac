@@ -31,16 +31,22 @@ esac
 dnl --- Viewer backend selection ---
 AC_ARG_WITH([viewer],
     [AS_HELP_STRING([--with-viewer=gtk|xlib|cocoa|auto],
-        [windowing backend: gtk (Linux, GTK3), xlib (Linux, X11 only), cocoa (macOS), auto (default)])],
+        [windowing backend: gtk (Linux, GTK3, display-only), xlib (Linux, X11 only, full features), cocoa (macOS), auto (default: xlib on Linux, cocoa on macOS)])],
     [viewer_backend="$withval"],
     [viewer_backend="auto"])
 
 dnl Resolve 'auto'
+dnl   macOS  -> cocoa
+dnl   Linux  -> xlib  (the default since the mouse-interaction work; the
+dnl                    Xlib viewer is more capable than GTK and needs no
+dnl                    GTK/GLib, matching the lighter-dependency preference
+dnl                    in giza issue #85.  GTK remains available explicitly
+dnl                    via --with-viewer=gtk.)
 if test "$viewer_backend" = "auto"; then
     if test "$build_cocoa" = "yes"; then
         viewer_backend="cocoa"
     else
-        viewer_backend="gtk"
+        viewer_backend="xlib"
     fi
 fi
 

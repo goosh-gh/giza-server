@@ -58,16 +58,16 @@ effect on the protocol or the driver.
 
 | Platform | Backend | Dependencies |
 |----------|---------|--------------|
-| Linux / WSL2 | GTK 3 + Cairo | `libgtk-3-dev libcairo2-dev` |
-| Linux / WSL2 | **Xlib + Cairo** (no GTK/GLib) | `libx11-dev libcairo2-dev` |
+| Linux / WSL2 | **Xlib + Cairo** (default, no GTK/GLib) | `libx11-dev libcairo2-dev` |
+| Linux / WSL2 | GTK 3 + Cairo (legacy, display-only) | `libgtk-3-dev libcairo2-dev` |
 | macOS (Apple Silicon / x86_64) | Cocoa (NSWindow) | system Cocoa.framework |
 
 The backend is detected automatically at configure time (`--with-viewer=auto`,
-which picks GTK on Linux and Cocoa on macOS).  Override with:
+which picks **Xlib** on Linux and Cocoa on macOS).  Override with:
 
 ```bash
-./configure --with-viewer=gtk      # GTK 3 (Linux)
-./configure --with-viewer=xlib     # Xlib only — no GTK/GLib/GIO required
+./configure --with-viewer=xlib     # Xlib only (Linux default) — no GTK/GLib/GIO
+./configure --with-viewer=gtk      # GTK 3 (Linux, display-only legacy backend)
 ./configure --with-viewer=cocoa    # macOS Cocoa
 ```
 
@@ -87,9 +87,10 @@ cairo-drawn tab bar — click to switch, per-tab `×` to close, WM-close discard
 the whole group), and the close-signals-the-client lifecycle; vector
 `File ▸ Save` and `RESIZE` resize replot are not yet wired on Xlib. The
 **GTK** viewer is the original display-only backend (PNG frames, titles,
-persistence) — no sliders, save, mouse interaction, or tabs. On Linux, prefer
-`--with-viewer=xlib`; the default `./configure` auto-detects **GTK**, so build
-Xlib explicitly if you want the interactive sliders, mouse zoom/pan, and tabs.
+persistence) — no sliders, save, mouse interaction, or tabs. On Linux, the
+default `./configure` now auto-detects **Xlib**, so you get the interactive
+sliders, mouse zoom/pan, and tabs out of the box; the legacy GTK backend is
+still available via `--with-viewer=gtk` if you specifically need it.
 
 ## Architecture
 
@@ -192,7 +193,33 @@ knows the axis limits and margins).
 
 ## Build
 
-### Linux — GTK 3 (default)
+### Linux — Xlib (default)
+
+The Xlib backend is the Linux default. It links only against `libX11`,
+`cairo`, `cairo-xlib`, `libpng`, and `libpthread` — all standard X11 system
+libraries, no GTK/GLib/GIO — and carries the full interactive feature set
+(sliders, mouse zoom/pan, cursor/pick reporting, tabs). This lighter
+dependency footprint matches the preference expressed in giza issue #85.
+
+```bash
+# Prerequisites
+sudo apt install libx11-dev libcairo2-dev
+
+# Build
+autoreconf -fi
+./configure            # auto-detects Xlib on Linux
+make
+
+# Verify no GTK/GLib linkage
+ldd giza_server | grep -i gtk   # should be empty
+
+sudo make install
+```
+
+### Linux — GTK 3 (legacy, display-only)
+
+The original GTK backend is display-only (no sliders, save, mouse
+interaction, or tabs) and is kept for compatibility. Build it explicitly:
 
 ```bash
 # Prerequisites
@@ -200,30 +227,8 @@ sudo apt install libgtk-3-dev libcairo2-dev
 
 # Build
 autoreconf -fi
-./configure            # auto-detects GTK on Linux
+./configure --with-viewer=gtk
 make
-sudo make install
-```
-
-### Linux — Xlib only (no GTK/GLib required)
-
-For minimal-dependency systems, CI containers, or HPC clusters where GTK 3 is
-unavailable, build the Xlib backend instead.  It links only against
-`libX11`, `cairo`, `cairo-xlib`, `libpng`, and `libpthread` — all standard
-X11 system libraries.
-
-```bash
-# Prerequisites (subset of the GTK build)
-sudo apt install libx11-dev libcairo2-dev
-
-# Build
-autoreconf -fi
-./configure --with-viewer=xlib
-make
-
-# Verify no GTK/GLib linkage
-ldd giza_server | grep -i gtk   # should be empty
-
 sudo make install
 ```
 
@@ -252,8 +257,8 @@ lives under `/opt/local`. Use the Xcode `clang` and the MacPorts
 Force a specific backend:
 
 ```bash
-./configure --with-viewer=gtk      # GTK 3 (Linux, display-only)
-./configure --with-viewer=xlib     # Xlib only (Linux, full features)
+./configure --with-viewer=xlib     # Xlib only (Linux default, full features)
+./configure --with-viewer=gtk      # GTK 3 (Linux, legacy display-only)
 ./configure --with-viewer=cocoa    # macOS Cocoa
 ```
 
@@ -384,8 +389,8 @@ follows the same pattern as the giza `/osx` driver (PR #86):
 ```
 viewer/
   giza-server-protocol.h   — GSP wire format (shared by driver + viewer)
-  giza-server-gtk.c        — GTK 3 viewer (Linux, default)
-  giza-server-xlib.c       — Xlib viewer (Linux, no GTK/GLib)
+  giza-server-gtk.c        — GTK 3 viewer (Linux, legacy display-only)
+  giza-server-xlib.c       — Xlib viewer (Linux, default; no GTK/GLib)
   giza-server-cocoa.m      — Cocoa viewer (macOS)
   giza-server-main.m       — macOS main-thread bootstrapper
 src/
