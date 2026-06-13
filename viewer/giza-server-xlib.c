@@ -165,6 +165,14 @@ typedef struct {
     uint32_t   group_id;    /* client PID; 0 = standalone (never shares)  */
     int        width, height;
     int        active;      /* GS.wins[] slot index of the visible tab; -1 */
+    /* Zoom / pan state (main thread only) */
+    double     zoom;        /* 1.0 = fit (no zoom), >1 magnified           */
+    double     pan_x;       /* fraction of plot area: 0 = centred          */
+    double     pan_y;
+    /* Drag-pan tracking */
+    int        drag_x, drag_y;    /* screen coords at button-press start   */
+    double     pan_x0, pan_y0;   /* pan at drag start                      */
+    int        dragging;          /* 1 while Button1 held outside sliders   */
 } GsContainer;
 
 /* ------------------------------------------------------------------ */
@@ -348,6 +356,10 @@ static int _create_container(uint32_t gid, int w, int h)
         c->width    = w ? w : DEFAULT_WIN_W;
         c->height   = h ? h : DEFAULT_WIN_H;
         c->active   = -1;
+        c->zoom     = 1.0;  /* no zoom initially */
+        c->pan_x    = 0.0;
+        c->pan_y    = 0.0;
+        c->dragging = 0;
 
         c->xwin = XCreateSimpleWindow(
             GS.dpy, RootWindow(GS.dpy, GS.screen),
@@ -358,7 +370,8 @@ static int _create_container(uint32_t gid, int w, int h)
         c->gc = XCreateGC(GS.dpy, c->xwin, 0, NULL);
         XSelectInput(GS.dpy, c->xwin,
                      ExposureMask | StructureNotifyMask |
-                     ButtonPressMask | Button1MotionMask);
+                     ButtonPressMask | Button1MotionMask |
+                     ButtonReleaseMask | PointerMotionMask);
         XMapRaised(GS.dpy, c->xwin);
         return i;
     }
@@ -603,10 +616,32 @@ _repaint_container(GsContainer *c)
     _body_geom(c, n, &bx, &by, &bw, &bh);
 
     if (win && win->surface) {
-        cairo_save(cr);
-        cairo_set_source_surface(cr, win->surface, bx, by);
-        cairo_paint(cr);
-        cairo_restore(cr);
+        /* Letterbox + zoom/pan: scale image to fit plot area, then apply zoom. */
+        int    iw   = cairo_image_surface_get_width(win->surface);
+        int    ih   = cairo_image_surface_get_height(win->surface);
+        /* plot area excludes slider strips */
+        double pw   = (double)bw - SLIDER_W;
+        double ph   = (double)bh - SLIDER_H;
+        if (pw > 0 && ph > 0 && iw > 0 && ih > 0) {
+            double sx    = pw / (double)iw;
+            double sy    = ph / (double)ih;
+            double scale = (sx < sy) ? sx : sy;
+            double dw    = iw * scale * c->zoom;
+            double dh    = ih * scale * c->zoom;
+            double ox    = bx + (pw - dw) / 2.0 + c->pan_x * dw;
+            double oy    = by + (ph - dh) / 2.0 + c->pan_y * dh;
+            cairo_save(cr);
+            cairo_translate(cr, ox, oy);
+            cairo_scale(cr, scale * c->zoom, scale * c->zoom);
+            cairo_set_source_surface(cr, win->surface, 0, 0);
+            cairo_paint(cr);
+            cairo_restore(cr);
+        } else {
+            cairo_save(cr);
+            cairo_set_source_surface(cr, win->surface, bx, by);
+            cairo_paint(cr);
+            cairo_restore(cr);
+        }
         _draw_sliders(cr, win, bx, by, bw, bh);
     }
 
@@ -791,6 +826,74 @@ _slider_send(GsWindow *win, uint8_t id, float value)
     pthread_mutex_unlock(&win->write_lock);
 }
 
+/* Send GSP_MSG_CURSOR or GSP_MSG_PICK with image-fraction coords. */
+static void
+_cursor_send_xlib(GsWindow *win, float fx, float fy, uint8_t buttons, uint8_t type)
+{
+    if (!win) return;
+    pthread_mutex_lock(&win->write_lock);
+    int fd = win->client_fd;
+    if (fd >= 0) {
+        gsp_cursor_t body;
+        body.x       = fx;
+        body.y       = fy;
+        body.buttons = buttons;
+        if (_send_hdr(fd, type, (uint32_t)sizeof(body), 0) == 0)
+            _write_exact(fd, &body, sizeof(body));
+    }
+    pthread_mutex_unlock(&win->write_lock);
+}
+
+/* Send GSP_MSG_ZOOM with current zoom/pan state. */
+static void
+_zoom_send_xlib(GsWindow *win, float zoom, float pan_x, float pan_y)
+{
+    if (!win) return;
+    pthread_mutex_lock(&win->write_lock);
+    int fd = win->client_fd;
+    if (fd >= 0) {
+        gsp_zoom_t body;
+        body.zoom  = zoom;
+        body.pan_x = pan_x;
+        body.pan_y = pan_y;
+        if (_send_hdr(fd, GSP_MSG_ZOOM, (uint32_t)sizeof(body), 0) == 0)
+            _write_exact(fd, &body, sizeof(body));
+    }
+    pthread_mutex_unlock(&win->write_lock);
+}
+
+/* Convert container-local event coords to image fractions [0,1].
+ * Returns 1 if inside the plot image, 0 if outside (or in slider strips). */
+static int
+_cont_to_image_frac(GsContainer *c, int n_tabs, int ex, int ey,
+                    double *fx, double *fy)
+{
+    int bx, by, bw, bh;
+    _body_geom(c, n_tabs, &bx, &by, &bw, &bh);
+    int ci = (int)(c - GS.conts);
+    GsWindow *win = (c->active >= 0 && GS.wins[c->active].alive &&
+                     GS.wins[c->active].container == ci)
+                    ? &GS.wins[c->active] : NULL;
+    if (!win || !win->surface) return 0;
+    int    iw   = cairo_image_surface_get_width(win->surface);
+    int    ih   = cairo_image_surface_get_height(win->surface);
+    double pw   = (double)bw - SLIDER_W;
+    double ph   = (double)bh - SLIDER_H;
+    if (pw <= 0 || ph <= 0 || iw <= 0 || ih <= 0) return 0;
+    double sx    = pw / (double)iw;
+    double sy    = ph / (double)ih;
+    double scale = (sx < sy) ? sx : sy;
+    double dw    = iw * scale * c->zoom;
+    double dh    = ih * scale * c->zoom;
+    double ox    = bx + (pw - dw) / 2.0 + c->pan_x * dw;
+    double oy    = by + (ph - dh) / 2.0 + c->pan_y * dh;
+    double rx    = ((double)ex - ox) / dw;
+    double ry    = ((double)ey - oy) / dh;   /* Xlib: y down = image y down, no flip */
+    if (rx < 0.0 || rx > 1.0 || ry < 0.0 || ry > 1.0) return 0;
+    *fx = rx; *fy = ry;
+    return 1;
+}
+
 /* Pointer pressed/dragged at container-relative (ex,ey) over the active
  * tab's body rect (bx,by,bw,bh). If it lands on the bottom (k) or right (A)
  * slider strip, update that slider, repaint, and push the value to the tab's
@@ -873,12 +976,28 @@ _handle_xevent(XEvent *ev)
         }
         break;
 
-    case ButtonPress:
+    case ButtonPress: {
+        GsContainer *c = _container_for_xwin(ev->xbutton.window);
+        if (!c) break;
+        int tabs[MAX_WINDOWS];
+        int n = _container_tabs((int)(c - GS.conts), tabs, MAX_WINDOWS);
+
+        /* Scroll wheel (Button4 = up, Button5 = down) → zoom about centre. */
+        if (ev->xbutton.button == Button4 || ev->xbutton.button == Button5) {
+            double factor = (ev->xbutton.button == Button4) ? 1.1 : (1.0 / 1.1);
+            c->zoom *= factor;
+            if (c->zoom < 1.0) { c->zoom = 1.0; c->pan_x = 0.0; c->pan_y = 0.0; }
+            if (c->zoom > 40.0) c->zoom = 40.0;
+            _repaint_container(c);
+            GsWindow *aw = (c->active >= 0 && GS.wins[c->active].alive)
+                           ? &GS.wins[c->active] : NULL;
+            if (aw) _zoom_send_xlib(aw, (float)c->zoom,
+                                    (float)c->pan_x, (float)c->pan_y);
+            break;
+        }
+
         if (ev->xbutton.button == Button1) {
-            GsContainer *c = _container_for_xwin(ev->xbutton.window);
-            if (!c) break;
-            int tabs[MAX_WINDOWS];
-            int n = _container_tabs((int)(c - GS.conts), tabs, MAX_WINDOWS);
+            /* Tab-bar click (switch/close tab) takes priority. */
             if (n >= 2 && ev->xbutton.y < TABBAR_H) {
                 int want_close = 0;
                 int slot = _tabbar_hit(c, tabs, n, ev->xbutton.x,
@@ -895,14 +1014,98 @@ _handle_xevent(XEvent *ev)
                 }
                 break;
             }
-            _body_slider_event(c, ev->xbutton.x, ev->xbutton.y);
+
+            /* Slider strips claim the event first. _body_slider_event is a
+             * no-op when the click is outside both strips, so detect that by
+             * checking the strip geometry here for pan/pick routing. */
+            int bx, by, bw, bh;
+            _body_geom(c, n, &bx, &by, &bw, &bh);
+            double pw = (double)bw - SLIDER_W;
+            double ph = (double)bh - SLIDER_H;
+            int in_slider = (ev->xbutton.x - bx >= pw) ||
+                            (ev->xbutton.y - by >= ph);
+            if (in_slider) {
+                _body_slider_event(c, ev->xbutton.x, ev->xbutton.y);
+                break;
+            }
+
+            /* Plot-area click: emit PICK, and start a drag-pan (only meaningful
+             * when zoomed in). */
+            double fx, fy;
+            GsWindow *aw = (c->active >= 0 && GS.wins[c->active].alive)
+                           ? &GS.wins[c->active] : NULL;
+            if (aw && _cont_to_image_frac(c, n, ev->xbutton.x, ev->xbutton.y,
+                                          &fx, &fy))
+                _cursor_send_xlib(aw, (float)fx, (float)fy, 1, GSP_MSG_PICK);
+
+            c->dragging = (c->zoom > 1.0);
+            c->drag_x   = ev->xbutton.x;
+            c->drag_y   = ev->xbutton.y;
+            c->pan_x0   = c->pan_x;
+            c->pan_y0   = c->pan_y;
+        } else if (ev->xbutton.button == Button2) {
+            /* Middle click resets zoom/pan. */
+            c->zoom = 1.0; c->pan_x = 0.0; c->pan_y = 0.0;
+            c->dragging = 0;
+            _repaint_container(c);
+            GsWindow *aw = (c->active >= 0 && GS.wins[c->active].alive)
+                           ? &GS.wins[c->active] : NULL;
+            if (aw) _zoom_send_xlib(aw, 1.0f, 0.0f, 0.0f);
         }
         break;
+    }
+
+    case ButtonRelease: {
+        GsContainer *c = _container_for_xwin(ev->xbutton.window);
+        if (c && c->dragging) {
+            c->dragging = 0;
+            GsWindow *aw = (c->active >= 0 && GS.wins[c->active].alive)
+                           ? &GS.wins[c->active] : NULL;
+            if (aw) _zoom_send_xlib(aw, (float)c->zoom,
+                                    (float)c->pan_x, (float)c->pan_y);
+        }
+        break;
+    }
 
     case MotionNotify: {
-        /* Button1MotionMask ⇒ only delivered while button 1 is held. */
         GsContainer *c = _container_for_xwin(ev->xmotion.window);
-        if (c) _body_slider_event(c, ev->xmotion.x, ev->xmotion.y);
+        if (!c) break;
+        int tabs[MAX_WINDOWS];
+        int n = _container_tabs((int)(c - GS.conts), tabs, MAX_WINDOWS);
+
+        /* Drag-pan: Button1 held outside slider strips while zoomed. */
+        if (c->dragging && (ev->xmotion.state & Button1Mask)) {
+            int bx, by, bw, bh;
+            _body_geom(c, n, &bx, &by, &bw, &bh);
+            double dw = ((double)bw - SLIDER_W) * c->zoom;
+            double dh = ((double)bh - SLIDER_H) * c->zoom;
+            if (dw > 0 && dh > 0) {
+                c->pan_x = c->pan_x0 + (ev->xmotion.x - c->drag_x) / dw;
+                c->pan_y = c->pan_y0 + (ev->xmotion.y - c->drag_y) / dh;
+                double max_px = 0.5 * (1.0 - 1.0 / c->zoom);
+                if (c->pan_x < -max_px) c->pan_x = -max_px;
+                if (c->pan_x >  max_px) c->pan_x =  max_px;
+                if (c->pan_y < -max_px) c->pan_y = -max_px;
+                if (c->pan_y >  max_px) c->pan_y =  max_px;
+                _repaint_container(c);
+            }
+            break;
+        }
+
+        /* Button1 held over a slider strip → slider drag (legacy behaviour). */
+        if (ev->xmotion.state & Button1Mask) {
+            _body_slider_event(c, ev->xmotion.x, ev->xmotion.y);
+        }
+
+        /* Plain motion (no button) → cursor coordinate report. */
+        double fx, fy;
+        GsWindow *aw = (c->active >= 0 && GS.wins[c->active].alive)
+                       ? &GS.wins[c->active] : NULL;
+        if (aw && _cont_to_image_frac(c, n, ev->xmotion.x, ev->xmotion.y,
+                                      &fx, &fy)) {
+            uint8_t btn = (ev->xmotion.state & Button1Mask) ? 1 : 0;
+            _cursor_send_xlib(aw, (float)fx, (float)fy, btn, GSP_MSG_CURSOR);
+        }
         break;
     }
 

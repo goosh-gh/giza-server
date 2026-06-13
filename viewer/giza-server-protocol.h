@@ -75,6 +75,9 @@ gsp_resolve_sock_path(char *buf, size_t n)
 #define GSP_MSG_SAVEREQ 0x14u  /* server → client: render & return vector (PDF/SVG) */
 #define GSP_MSG_SAVEDATA 0x15u /* client → server: vector bytes for a pending save   */
 #define GSP_MSG_RESIZE  0x16u  /* server → client: window resized, re-render at new px */
+#define GSP_MSG_ZOOM    0x17u  /* server → client: zoom/pan changed (optional notify) */
+#define GSP_MSG_CURSOR  0x18u  /* server → client: mouse cursor moved (image coords)  */
+#define GSP_MSG_PICK    0x19u  /* server → client: mouse click   (image coords)       */
 #define GSP_MSG_CLOSE   0x20u  /* client → server: close this window   */
 #define GSP_MSG_ACK     0x21u  /* server → client: acknowledged        */
 #define GSP_MSG_ERR     0xFFu  /* server → client: error (+ message)   */
@@ -119,6 +122,36 @@ gsp_resolve_sock_path(char *buf, size_t n)
  *   client-absent window (a plain show() window after its script exited)
  *   gets no RESIZE — the viewer just letterbox-scales its last PNG.
  *   Total payload: 8 bytes.
+ */
+
+/* GSP_MSG_ZOOM payload:
+ *   gsp_zoom_t  (12 bytes)
+ *   server → client, fire-and-forget.  Sent when the user zooms or pans
+ *   the viewer window (zoom != 1.0 means magnified; pan_x/pan_y are
+ *   fractional offsets in [-0.5, 0.5] of the image dimensions).
+ *   Optional: clients that do not register an on_zoom callback ignore it.
+ *   Total payload: 12 bytes.
+ */
+
+/* GSP_MSG_CURSOR payload:
+ *   gsp_cursor_t  (9 bytes)
+ *   server → client, fire-and-forget.  Sent on every mouse-move event
+ *   while the pointer is within the plot image area.  (x, y) are image
+ *   fractions in [0.0, 1.0]: (0,0) = top-left, (1,1) = bottom-right of
+ *   the rendered image.  Clients convert to data coordinates using their
+ *   own xlim/ylim.  buttons is 0 for plain motion, 1 for Button1 held.
+ *   Optional: clients that do not register an on_cursor callback ignore it.
+ *   Total payload: 9 bytes.
+ */
+
+/* GSP_MSG_PICK payload:
+ *   gsp_cursor_t  (same struct, 9 bytes)
+ *   server → client, fire-and-forget.  Sent on mouse-button press within
+ *   the plot image area.  buttons encodes the button number (1=left,
+ *   2=middle, 3=right).  Clients convert (x,y) to data coordinates and
+ *   search for the nearest data point.
+ *   Optional: clients that do not register an on_pick callback ignore it.
+ *   Total payload: 9 bytes.
  */
 
 /* ------------------------------------------------------------------ */
@@ -176,6 +209,19 @@ typedef struct __attribute__((packed)) {
     uint32_t width_px;
     uint32_t height_px;
 } gsp_resize_t;   /* 8 bytes */
+
+typedef struct __attribute__((packed)) {
+    float    zoom;    /* scale factor: 1.0 = fit-to-window, >1 = magnified */
+    float    pan_x;   /* fractional horizontal offset: 0.0 = centred       */
+    float    pan_y;   /* fractional vertical   offset: 0.0 = centred       */
+} gsp_zoom_t;     /* 12 bytes */
+
+typedef struct __attribute__((packed)) {
+    float    x;       /* image fraction [0,1]: 0=left,  1=right            */
+    float    y;       /* image fraction [0,1]: 0=top,   1=bottom           */
+    uint8_t  buttons; /* for CURSOR: 0=motion,1=btn1 held                  */
+                      /* for PICK:   1=left, 2=middle, 3=right             */
+} gsp_cursor_t;   /* 9 bytes */
 
 /* ------------------------------------------------------------------ */
 /* Timeouts & limits                                                   */

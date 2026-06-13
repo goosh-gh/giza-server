@@ -44,6 +44,12 @@ Resizing an interactive window likewise replots at the new size over the
 server→client `RESIZE` channel, so the figure is re-laid-out rather than
 bitmap-scaled.
 
+Mouse interaction is verified on macOS as well: zooming (pinch or
+Ctrl+scroll) and panning (drag while zoomed) are handled entirely in the
+viewer, and the cursor position, clicks, and zoom/pan state are reported
+back to the client over the `CURSOR`, `PICK`, and `ZOOM` channels — see
+**Mouse interaction** below.
+
 ## Backends
 
 The viewer is a **standalone binary** (`giza_server`) separate from the `/gs`
@@ -69,18 +75,21 @@ which picks GTK on Linux and Cocoa on macOS).  Override with:
 interactive set: `SLIDER` reverse channel, `File ▸ Save` (PNG and
 reverse-channel PDF/SVG), `RESIZE` resize replot (re-renders an interactive
 window's figure at the new size on resize, rather than bitmap-scaling),
-per-PID tab grouping, and the close-signals-the-client lifecycle. The
-**Xlib** (Linux) viewer implements
+**mouse zoom/pan and cursor/pick reporting** (`CURSOR`/`PICK`/`ZOOM`
+channels), per-PID tab grouping, and the close-signals-the-client lifecycle.
+The **Xlib** (Linux) viewer implements
 the `SLIDER` reverse channel (a bottom strip drives slider id 0 = k, a right
-strip drives id 1 = A; dragging sends the value to the client), per-PID tab
+strip drives id 1 = A; dragging sends the value to the client),
+**mouse zoom/pan and cursor/pick reporting** (wheel to zoom, drag to pan
+while zoomed, middle-click to reset), per-PID tab
 grouping (figures from the same client process share one window with a
 cairo-drawn tab bar — click to switch, per-tab `×` to close, WM-close discards
 the whole group), and the close-signals-the-client lifecycle; vector
 `File ▸ Save` and `RESIZE` resize replot are not yet wired on Xlib. The
 **GTK** viewer is the original display-only backend (PNG frames, titles,
-persistence) — no sliders, save, or tabs. On Linux, prefer
+persistence) — no sliders, save, mouse interaction, or tabs. On Linux, prefer
 `--with-viewer=xlib`; the default `./configure` auto-detects **GTK**, so build
-Xlib explicitly if you want the interactive sliders and tabs.
+Xlib explicitly if you want the interactive sliders, mouse zoom/pan, and tabs.
 
 ## Architecture
 
@@ -103,7 +112,7 @@ typedef struct {
     uint32_t magic;    /* 0x47495A41 "GIZA" */
     uint8_t  version;
     uint8_t  type;     /* PNG, NEWWIN, CLOSE, PING/PONG, TITLE, SLIDER,
-                          SAVEREQ, SAVEDATA, RESIZE ... */
+                          SAVEREQ, SAVEDATA, RESIZE, ZOOM, CURSOR, PICK ... */
     uint16_t flags;
     uint32_t length;   /* payload bytes */
     uint32_t seq;
@@ -121,6 +130,9 @@ typedef struct {
 | `SAVEREQ` | server→client | **none** (reverse-channel save request) |
 | `SAVEDATA` | client→server | **none** (rendered vector bytes) |
 | `RESIZE` | server→client | **none** (reverse-channel resize replot) |
+| `ZOOM` | server→client | **none** (zoom/pan changed, optional notify) |
+| `CURSOR` | server→client | **none** (cursor moved, image fraction) |
+| `PICK` | server→client | **none** (mouse click, image fraction) |
 
 `SLIDER` carries a 5-byte packed `gsp_slider_t` payload (`uint8_t` slider id
 + `float` value), letting one message type drive any number of sliders.
@@ -140,6 +152,43 @@ at the new size and pushes it back through the normal `PNG` path, so the plot
 is re-laid-out for the new geometry instead of being bitmap-scaled. A
 client-absent window (a plain `show()` window after its script exited) gets no
 `RESIZE` — the viewer just letterbox-scales its last frame.
+
+`ZOOM`, `CURSOR`, and `PICK` implement **mouse interaction**. Zooming and
+panning are handled entirely inside the viewer (the received PNG is scaled
+and offset on screen — no re-render round-trip), so they work even for a
+client that has already exited. When a client is alive, the viewer also
+reports activity back so the client can react:
+
+- `CURSOR(x, y, buttons)` — sent on mouse-move, where `(x, y)` are **image
+  fractions** in `[0, 1]`: `(0, 0)` is the top-left of the rendered image and
+  `(1, 1)` the bottom-right. The client converts to data coordinates using its
+  own `xlim`/`ylim`.
+- `PICK(x, y, button)` — sent on a mouse-button press inside the plot, same
+  image-fraction convention; `button` is 1 = left, 2 = middle, 3 = right.
+- `ZOOM(zoom, pan_x, pan_y)` — sent when the zoom factor or pan offset
+  changes (`zoom` 1.0 = fit, `pan_*` fractional offsets). Purely a notify;
+  the client need not act on it.
+
+All three are fire-and-forget (`gsp_cursor_t` is a 9-byte packed
+`float x, float y, uint8_t buttons`; `gsp_zoom_t` is 12 bytes of three
+`float`s). Each is optional on the client side — `Driver::GS` invokes the
+matching callback (`on_cursor` / `on_pick` / `on_zoom`) only if one was
+registered, and otherwise consumes and ignores the message.
+
+### Mouse interaction (user controls)
+
+| Action | macOS (Cocoa) | Linux (Xlib) |
+|--------|---------------|--------------|
+| Zoom | pinch, or **Ctrl + scroll** | **scroll wheel** |
+| Pan (only while zoomed) | drag the plot, or two-finger scroll | drag the plot |
+| Reset zoom/pan | **double-click** | **middle-click** |
+| Pick (report click) | single click in plot | single click in plot |
+| Cursor readout | move the mouse over the plot | move the mouse over the plot |
+
+On macOS a live coordinate label is shown in the top-right of the plot area
+while the cursor is inside it. The coordinates reported to the client are
+image fractions; converting them to data coordinates is the client's job (it
+knows the axis limits and margins).
 
 ## Build
 
@@ -247,6 +296,31 @@ peek drains the backlog, latest value wins), so fast dragging stays
 responsive even when redraws are heavy. Quit the viewer with ⌘Q or the
 **Quit** menu item.
 
+`examples/client_mouse.c` — the mouse counterpart, demonstrating the
+server→client `GSP_MSG_CURSOR` / `GSP_MSG_PICK` / `GSP_MSG_ZOOM` channels.
+Also pure GSP + Cairo, no libgiza.
+
+It draws a scatter plot. Moving the mouse over the plot prints the cursor
+position (image fraction and the data coordinates this client maps it to);
+clicking reports the nearest data point and highlights it; scrolling/pinching
+to zoom and dragging to pan print the zoom/pan state. Coordinates arrive as
+image fractions in `[0, 1]`, which the client converts to data coordinates
+using the plot rectangle it drew into.
+
+```bash
+# build (cairo required; the relative include resolves ../viewer/protocol.h)
+clang examples/client_mouse.c \
+  $(pkg-config --cflags --libs cairo) -lm -o client_mouse
+
+# run: start the server first, then the client
+./giza_server &
+./client_mouse
+```
+
+Cursor events are coalesced the same way as slider events, so moving the
+mouse quickly will not flood the client. See **Mouse interaction** above for
+the per-platform controls.
+
 ## macOS Cocoa design notes
 
 The macOS backend (`viewer/giza-server-cocoa.m` + `viewer/giza-server-main.m`)
@@ -293,6 +367,18 @@ follows the same pattern as the giza `/osx` driver (PR #86):
   vector items gray out (`validateMenuItem:`), since there is no client left
   to re-render; PNG stays enabled.
 
+- **Mouse zoom/pan & reporting.** The `GsView` keeps its own zoom/pan state and
+  applies it inside `drawRect:` (the same letterbox maths, then scaled by
+  `zoom` and offset by `pan_x/pan_y`), so zooming never round-trips to the
+  client. An `NSTrackingArea` enables `mouseMoved:` for the cursor readout;
+  `magnifyWithEvent:` and `scrollWheel:` drive zoom, `mouseDragged:` drives pan
+  (only while zoomed). View points are converted to **image fractions** through
+  `_viewPoint:toImageFx:fy:`, which inverts the letterbox+zoom transform and
+  flips Cocoa's bottom-left origin to the image's top-down convention before
+  the value is sent as `CURSOR`/`PICK`. The Xlib viewer mirrors this with
+  per-container zoom/pan state and a matching `_cont_to_image_frac` (no y-flip
+  there, since X is already top-down).
+
 ## Files
 
 ```
@@ -307,6 +393,7 @@ src/
   giza-driver-gs-private.h — driver header
 examples/
   client_slider.c          — bidirectional slider demo (GSP + Cairo)
+  client_mouse.c           — mouse cursor/pick/zoom demo (GSP + Cairo)
 patches/
   giza-v1.5.0-drivers.patch — patch for giza upstream
 ```

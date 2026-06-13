@@ -77,6 +77,8 @@
 static void _slider_send(int win_id, uint8_t slider_id, float value);
 static void _savereq_send(int win_id, uint8_t fmt);
 static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px);
+static void _cursor_send(int win_id, float fx, float fy, uint8_t buttons, uint8_t type);
+static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
 
 /* Live-drag fires windowDidResize: continuously; coalesce the burst and
  * emit one RESIZE this long after the last event (drag settled). Each
@@ -93,9 +95,28 @@ static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px);
     NSImage  *_image;   /* current plot frame          */
     NSLock   *_lock;
     int       win_id;   /* which window this view belongs to          */
+
+    /* Zoom / pan state (main thread only) */
+    double    _zoom;    /* 1.0 = fit-to-window, >1 = magnified        */
+    double    _pan_x;   /* fractional offset: 0 = centred             */
+    double    _pan_y;
+
+    /* Pan drag state */
+    NSPoint   _drag_start;  /* view-coords of mouseDown start point   */
+    double    _pan_x_start;
+    double    _pan_y_start;
+
+    /* Cursor label (overlay in top-right of plot area) */
+    NSTextField *_coord_label;
 }
 - (void)setImage:(NSImage *)img;
 - (void)sliderChanged:(NSSlider *)sender;
+/* Compute the letterbox destination rect for the current zoom/pan state.
+ * Helper used by drawRect: and the view→image coordinate converter. */
+- (NSRect)_plotDstRect;
+/* Convert a view point (Cocoa bottom-left origin) to image fractions.
+ * Returns YES if the point is within the image area. */
+- (BOOL)_viewPoint:(NSPoint)pt toImageFx:(double *)fx fy:(double *)fy;
 @end
 
 
@@ -136,11 +157,46 @@ static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px);
 {
     self = [super initWithFrame:frame];
     if (self) {
-        _lock  = [[NSLock alloc] init];
-        _image = nil;
-        win_id = -1;
+        _lock   = [[NSLock alloc] init];
+        _image  = nil;
+        win_id  = -1;
+        _zoom   = 1.0;
+        _pan_x  = 0.0;
+        _pan_y  = 0.0;
+
+        /* Coordinate readout label (top-right corner, hidden until cursor enters) */
+        _coord_label = [[NSTextField alloc] initWithFrame:NSMakeRect(0,0,180,20)];
+        [_coord_label setEditable:NO];
+        [_coord_label setSelectable:NO];
+        [_coord_label setBordered:NO];
+        [_coord_label setDrawsBackground:YES];
+        [_coord_label setBackgroundColor:
+            [NSColor colorWithCalibratedWhite:1.0 alpha:0.75]];
+        [_coord_label setFont:
+            [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular]];
+        [_coord_label setTextColor:[NSColor darkGrayColor]];
+        [_coord_label setAlignment:NSTextAlignmentRight];
+        [_coord_label setHidden:YES];
+        [self addSubview:_coord_label];
+
+        /* Enable mouse-move events (needed for cursor tracking) */
+        NSTrackingAreaOptions opts =
+            NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited |
+            NSTrackingActiveInActiveApp | NSTrackingInVisibleRect;
+        NSTrackingArea *ta = [[NSTrackingArea alloc]
+            initWithRect:NSZeroRect options:opts owner:self userInfo:nil];
+        [self addTrackingArea:ta];
+        [ta release];
     }
     return self;
+}
+
+- (void)dealloc
+{
+    [_image release];
+    [_lock  release];
+    [_coord_label release];
+    [super dealloc];
 }
 
 - (void)setImage:(NSImage *)img
@@ -159,6 +215,50 @@ static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px);
     _slider_send(self->win_id, (uint8_t)[sender tag], (float)[sender doubleValue]);
 }
 
+/* ---- coordinate helpers ------------------------------------------- */
+
+/* Return the destination NSRect where the image is drawn (bottom-left
+ * Cocoa coords), accounting for letterbox + zoom + pan. */
+- (NSRect)_plotDstRect
+{
+    [_lock lock];
+    NSImage *img = [_image retain];
+    [_lock unlock];
+    if (!img) return NSZeroRect;
+
+    NSSize  isize  = img.size;
+    [img release];
+
+    NSRect  bounds = self.bounds;
+    double  sx     = bounds.size.width  / isize.width;
+    double  sy     = bounds.size.height / isize.height;
+    double  scale  = (sx < sy) ? sx : sy;
+    double  dw     = isize.width  * scale * _zoom;
+    double  dh     = isize.height * scale * _zoom;
+    /* pan offsets are fractions of the *zoomed* image size */
+    double  ox     = (bounds.size.width  - dw) / 2.0 + _pan_x * dw;
+    double  oy     = (bounds.size.height - dh) / 2.0 + _pan_y * dh;
+    return NSMakeRect(ox, oy, dw, dh);
+}
+
+/* Convert view point (Cocoa bottom-left) → image fraction [0,1]×[0,1].
+ * (0,0) = top-left of image, (1,1) = bottom-right (top-down convention
+ * for the client, matching Cairo image surface origin). */
+- (BOOL)_viewPoint:(NSPoint)pt toImageFx:(double *)fx fy:(double *)fy
+{
+    NSRect dst = [self _plotDstRect];
+    if (dst.size.width == 0 || dst.size.height == 0) return NO;
+    double rx = (pt.x - dst.origin.x) / dst.size.width;
+    /* Cocoa y: up; image y: down — flip */
+    double ry = 1.0 - (pt.y - dst.origin.y) / dst.size.height;
+    if (rx < 0.0 || rx > 1.0 || ry < 0.0 || ry > 1.0) return NO;
+    *fx = rx;
+    *fy = ry;
+    return YES;
+}
+
+/* ---- drawRect: ------------------------------------------------------- */
+
 - (void)drawRect:(NSRect)dirtyRect
 {
     (void)dirtyRect;
@@ -173,23 +273,137 @@ static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px);
 
     if (!img) return;
 
-    NSSize  isize  = img.size;
-    NSRect  bounds = self.bounds;
-    double  sx     = bounds.size.width  / isize.width;
-    double  sy     = bounds.size.height / isize.height;
-    double  scale  = (sx < sy) ? sx : sy;
-    double  dw     = isize.width  * scale;
-    double  dh     = isize.height * scale;
-    double  ox     = (bounds.size.width  - dw) / 2.0;
-    double  oy     = (bounds.size.height - dh) / 2.0;
-
-    NSRect dst = NSMakeRect(ox, oy, dw, dh);
+    NSRect dst = [self _plotDstRect];
     [img drawInRect:dst
            fromRect:NSZeroRect
           operation:NSCompositingOperationSourceOver
            fraction:1.0];
 
     [img release];
+
+    /* Keep coord label in top-right of actual plot area */
+    if (![_coord_label isHidden]) {
+        NSRect lb  = [_coord_label frame];
+        double margin = 6.0;
+        [_coord_label setFrameOrigin:NSMakePoint(
+            dst.origin.x + dst.size.width - lb.size.width - margin,
+            dst.origin.y + dst.size.height - lb.size.height - margin)];
+    }
+}
+
+/* ---- zoom / pan event handlers -------------------------------------- */
+
+/* Accept first-responder so keyboard/scroll events reach us */
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)becomeFirstResponder  { return YES; }
+
+- (void)magnifyWithEvent:(NSEvent *)event
+{
+    /* Pinch gesture or Ctrl+two-finger-scroll on a trackpad */
+    _zoom *= (1.0 + event.magnification);
+    if (_zoom < 1.0) { _zoom = 1.0; _pan_x = 0.0; _pan_y = 0.0; }
+    if (_zoom > 40.0) _zoom = 40.0;
+    _zoom_send(self->win_id, (float)_zoom, (float)_pan_x, (float)_pan_y);
+    [self setNeedsDisplay:YES];
+}
+
+- (void)scrollWheel:(NSEvent *)event
+{
+    if (event.modifierFlags & NSEventModifierFlagControl) {
+        /* Ctrl + scroll = zoom */
+        double delta = event.scrollingDeltaY * 0.05;
+        _zoom *= (1.0 + delta);
+        if (_zoom < 1.0) { _zoom = 1.0; _pan_x = 0.0; _pan_y = 0.0; }
+        if (_zoom > 40.0) _zoom = 40.0;
+    } else if (_zoom > 1.0) {
+        /* Two-finger pan (only when zoomed) */
+        NSRect dst = [self _plotDstRect];
+        if (dst.size.width > 0) {
+            _pan_x += event.scrollingDeltaX / dst.size.width;
+            _pan_y -= event.scrollingDeltaY / dst.size.height; /* Cocoa y-flip */
+            /* clamp: don't pan so far the image leaves the viewport */
+            double max_px = 0.5 * (1.0 - 1.0/_zoom);
+            if (_pan_x < -max_px) _pan_x = -max_px;
+            if (_pan_x >  max_px) _pan_x =  max_px;
+            if (_pan_y < -max_px) _pan_y = -max_px;
+            if (_pan_y >  max_px) _pan_y =  max_px;
+        }
+    }
+    _zoom_send(self->win_id, (float)_zoom, (float)_pan_x, (float)_pan_y);
+    [self setNeedsDisplay:YES];
+}
+
+/* Double-click resets zoom/pan */
+- (void)mouseDown:(NSEvent *)event
+{
+    if (event.clickCount == 2) {
+        _zoom  = 1.0; _pan_x = 0.0; _pan_y = 0.0;
+        _zoom_send(self->win_id, 1.0f, 0.0f, 0.0f);
+        [self setNeedsDisplay:YES];
+        return;
+    }
+    /* Begin drag-pan */
+    _drag_start    = [self convertPoint:[event locationInWindow] fromView:nil];
+    _pan_x_start   = _pan_x;
+    _pan_y_start   = _pan_y;
+
+    /* Also send PICK event if inside plot */
+    NSPoint pt = [self convertPoint:[event locationInWindow] fromView:nil];
+    double fx, fy;
+    if ([self _viewPoint:pt toImageFx:&fx fy:&fy]) {
+        uint8_t btn = (uint8_t)([event buttonNumber] + 1);
+        _cursor_send(self->win_id, (float)fx, (float)fy, btn, GSP_MSG_PICK);
+    }
+}
+
+- (void)mouseDragged:(NSEvent *)event
+{
+    if (_zoom <= 1.0) return;   /* no pan when not zoomed */
+    NSPoint cur = [self convertPoint:[event locationInWindow] fromView:nil];
+    NSRect  dst = [self _plotDstRect];
+    if (dst.size.width == 0) return;
+    _pan_x = _pan_x_start + (cur.x - _drag_start.x) / dst.size.width;
+    _pan_y = _pan_y_start + (cur.y - _drag_start.y) / dst.size.height;
+    double max_px = 0.5 * (1.0 - 1.0/_zoom);
+    if (_pan_x < -max_px) _pan_x = -max_px;
+    if (_pan_x >  max_px) _pan_x =  max_px;
+    if (_pan_y < -max_px) _pan_y = -max_px;
+    if (_pan_y >  max_px) _pan_y =  max_px;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)mouseUp:(NSEvent *)event
+{
+    (void)event;
+    if (_zoom > 1.0)
+        _zoom_send(self->win_id, (float)_zoom, (float)_pan_x, (float)_pan_y);
+}
+
+/* ---- cursor (mouse-move) tracking ----------------------------------- */
+
+- (void)mouseMoved:(NSEvent *)event
+{
+    NSPoint pt = [self convertPoint:[event locationInWindow] fromView:nil];
+    double fx, fy;
+    BOOL inside = [self _viewPoint:pt toImageFx:&fx fy:&fy];
+    [_coord_label setHidden:!inside];
+    if (inside) {
+        /* Update label text.  (0,0)=top-left per image convention.  */
+        NSString *s = [NSString stringWithFormat:@" x=%.4f  y=%.4f ", fx, fy];
+        [_coord_label setStringValue:s];
+        /* Resize label to fit */
+        [_coord_label sizeToFit];
+        [self setNeedsDisplay:YES];
+        _cursor_send(self->win_id, (float)fx, (float)fy, 0, GSP_MSG_CURSOR);
+    }
+}
+
+- (void)mouseEntered:(NSEvent *)event { (void)event; }
+- (void)mouseExited:(NSEvent *)event
+{
+    (void)event;
+    [_coord_label setHidden:YES];
+    [self setNeedsDisplay:YES];
 }
 
 - (BOOL)isFlipped { return NO; }   /* Cocoa default: origin bottom-left */
@@ -1026,6 +1240,36 @@ static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px)
         w->last_sent_w = width_px;
         w->last_sent_h = height_px;
     }
+    pthread_mutex_unlock(&w->write_lock);
+}
+
+static void _cursor_send(int win_id, float fx, float fy, uint8_t buttons, uint8_t type)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive || w->client_fd < 0) return;
+    gsp_cursor_t body;
+    body.x       = fx;
+    body.y       = fy;
+    body.buttons = buttons;
+    pthread_mutex_lock(&w->write_lock);
+    if (w->client_fd >= 0)
+        _send_msg(w->client_fd, type, w->seq_out++, &body, sizeof(body));
+    pthread_mutex_unlock(&w->write_lock);
+}
+
+static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive || w->client_fd < 0) return;
+    gsp_zoom_t body;
+    body.zoom  = zoom;
+    body.pan_x = pan_x;
+    body.pan_y = pan_y;
+    pthread_mutex_lock(&w->write_lock);
+    if (w->client_fd >= 0)
+        _send_msg(w->client_fd, GSP_MSG_ZOOM, w->seq_out++, &body, sizeof(body));
     pthread_mutex_unlock(&w->write_lock);
 }
 
