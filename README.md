@@ -251,7 +251,12 @@ lives under `/opt/local`. Use the Xcode `clang` and the MacPorts
 `pkg-config` explicitly:
 
 ```bash
+autoreconf -if
 ./configure CC=clang OBJC=clang PKG_CONFIG=/opt/local/bin/pkg-config
+make -j4
+make check
+sudo make install
+pkill giza_server   # terminate any running instance before testing
 ```
 
 Force a specific backend:
