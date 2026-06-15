@@ -24,6 +24,21 @@ legacy display-only backend. Build it explicitly with
 **Migration:** if you relied on `./configure` producing a GTK build on Linux,
 add `--with-viewer=gtk` to keep that behaviour.
 
+### Fixed — server15: macOS mouse events now delivered correctly
+
+- **`[win setAcceptsMouseMovedEvents:YES]`** added in `_create_window_on_main`
+  (before `makeKeyAndOrderFront:`). Without this flag, `mouseMoved:` is never
+  delivered by the Cocoa runtime even when a tracking area with
+  `NSTrackingMouseMoved` is registered — cursor readout and `CURSOR`/`PICK`
+  messages were silently dropped on macOS while Xlib (PointerMotionMask) worked
+  fine.
+- **`-[GsView updateTrackingAreas]`** implemented so that the `NSTrackingArea`
+  is re-registered after every window resize, keeping cursor tracking alive
+  across resizes.
+
+Both fixes are in `viewer/giza-server-cocoa.m`; the Xlib and GTK backends are
+unaffected.
+
 ### Added — server14: mouse interaction
 
 - New protocol messages `GSP_MSG_ZOOM` (0x17), `GSP_MSG_CURSOR` (0x18) and

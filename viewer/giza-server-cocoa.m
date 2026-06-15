@@ -199,6 +199,19 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
     [super dealloc];
 }
 
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *ta in [self trackingAreas])
+        [self removeTrackingArea:ta];
+    NSTrackingAreaOptions opts =
+        NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited |
+        NSTrackingActiveInActiveApp | NSTrackingInVisibleRect;
+    NSTrackingArea *ta = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect options:opts owner:self userInfo:nil];
+    [self addTrackingArea:ta];
+    [ta release];
+}
+
 - (void)setImage:(NSImage *)img
 {
     [_lock lock];
@@ -1026,6 +1039,7 @@ static void _create_window_on_main(void *ptr)
         if (@available(macOS 10.12, *))
             [tab_host addTabbedWindow:win ordered:NSWindowAbove];
     }
+    [win setAcceptsMouseMovedEvents:YES];
     [win makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 
