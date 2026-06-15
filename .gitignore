@@ -50,3 +50,4 @@ giza-server-saved*.png
 # --- examples (compiled binaries; sources are tracked) ---
 /examples/client_slider
 /examples/client_mouse
+client_mouse
