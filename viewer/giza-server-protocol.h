@@ -83,10 +83,13 @@ gsp_resolve_sock_path(char *buf, size_t n)
 #define GSP_MSG_ERR     0xFFu  /* server → client: error (+ message)   */
 
 /* GSP_MSG_SLIDER payload:
- *   uint8_t  slider_id   (which slider: 0=freq k, 1=amplitude A, ...)
- *   float    value       (4 bytes, little-endian) — current slider value
- *   server → client, fire-and-forget (no ACK).
- *   Total payload: 5 bytes.
+ *   uint8_t  slider_id   (0 = horizontal (bottom), 1 = vertical (right))
+ *   float    value       (4 bytes, little-endian) — normalized [0,1]:
+ *                         horizontal 0=left..1=right,
+ *                         vertical   0=bottom..1=top.
+ *   The client assigns each slider's meaning (time offset, gain, ...) and
+ *   maps [0,1] to its own units; the viewer is value-domain agnostic.
+ *   server → client, fire-and-forget (no ACK).  Total payload: 5 bytes.
  */
 
 /* Vector-save format codes (GSP_MSG_SAVEREQ / GSP_MSG_SAVEDATA payloads). */
@@ -183,6 +186,12 @@ typedef struct __attribute__((packed)) {
  * GSP_MSG_NEWWIN payload:
  *   uint32_t  width_px    (suggested initial window width,  0 = default)
  *   uint32_t  height_px   (suggested initial window height, 0 = default)
+ *   Optionally followed by gsp_slider_t records giving each slider's
+ *   initial normalized [0,1] thumb position, keyed by slider_id.
+ *   Count = (length - 8) / sizeof(gsp_slider_t). Omitted ids default to
+ *   0.0. Backward compatible: a plain 8-byte NEWWIN keeps the defaults,
+ *   and an older viewer that reads only the first 8 bytes ignores the
+ *   trailing records.
  *
  * GSP_MSG_CLOSE / GSP_MSG_ACK / GSP_MSG_PING / GSP_MSG_PONG:
  *   No payload (length = 0).

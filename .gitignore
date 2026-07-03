@@ -51,3 +51,11 @@ giza-server-saved*.png
 /examples/client_slider
 /examples/client_mouse
 client_mouse
+*.backup
+*.o
+*.orig
+*.old
+*.back
+/giza_server
+viewer/giza-server-osx-3d.m
+viewer/giza-server-xlib-3d.c

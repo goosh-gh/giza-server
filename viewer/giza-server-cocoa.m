@@ -59,6 +59,14 @@
  *      so re-check liveness inside the block before using captured refs.
  *
  * Copyright (c) 2026 goosh-gh - LGPL-2.1 (same as giza)
+ *
+ * --- Phase 2 (2026-06-20): 3D viewer support added ---
+ * GsWindow gained an is_3d flag, latched true on the first
+ * GSP_MSG_3D_FRAME received for a window. GsView gained a parallel draw
+ * path (_draw3DFrame) and mouse handling for rotate-drag (sends
+ * GSP_MSG_3D_INPUT) instead of the 2D pan/zoom logic. See the "Phase 2"
+ * comments scattered through this file for the specific additions; the
+ * original 2D PNG-viewer logic above this notice is unchanged.
  */
 
 #import <Cocoa/Cocoa.h>
@@ -74,11 +82,14 @@
 #include <string.h>
 #include <errno.h>
 #include "giza-server-protocol.h"
+#include "gsp_3d.h"   /* Phase 2: 3D message types (0x24-0x27) */
 static void _slider_send(int win_id, uint8_t slider_id, float value);
 static void _savereq_send(int win_id, uint8_t fmt);
 static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px);
 static void _cursor_send(int win_id, float fx, float fy, uint8_t buttons, uint8_t type);
 static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
+static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
+                           uint8_t type, uint8_t key);   /* Phase 2 */
 
 /* Live-drag fires windowDidResize: continuously; coalesce the burst and
  * emit one RESIZE this long after the last event (drag settled). Each
@@ -108,6 +119,24 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
 
     /* Cursor label (overlay in top-right of plot area) */
     NSTextField *_coord_label;
+
+    /* --- Phase 2: 3D mode ---
+     * is_3d is latched true on the first GSP_MSG_3D_FRAME received for
+     * this window and never reset, so a window is either a 2D PNG
+     * viewer or a 3D primitive viewer for its whole lifetime - matching
+     * how Driver::GS3D opens a dedicated connection per 3D scene rather
+     * than switching an existing one. _3d_lock guards _3d_payload only
+     * (PNG path's _lock is untouched).
+     *
+     * REVIEW NOTE (2026-06-21): there used to be a separate _3d_labels
+     * NSMutableArray here, populated by per-message add3DLabel: calls.
+     * That design caused the label flicker described at set3DPayload:/
+     * _draw3DFrame - labels are now embedded in _3d_payload itself, so
+     * no separate label storage or clear/add methods are needed. */
+    int       _is_3d;
+    NSLock   *_3d_lock;
+    NSData   *_3d_payload;       /* raw GSP_MSG_3D_FRAME payload (lines+points+labels), parsed in drawRect: */
+    NSPoint   _rot_drag_start;   /* mouseDown point, 3D-rotate drag (separate from 2D _drag_start) */
 }
 - (void)setImage:(NSImage *)img;
 - (void)sliderChanged:(NSSlider *)sender;
@@ -117,6 +146,8 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
 /* Convert a view point (Cocoa bottom-left origin) to image fractions.
  * Returns YES if the point is within the image area. */
 - (BOOL)_viewPoint:(NSPoint)pt toImageFx:(double *)fx fy:(double *)fy;
+/* --- Phase 2: 3D mode --- */
+- (void)set3DPayload:(NSData *)payload;
 @end
 
 
@@ -164,6 +195,11 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
         _pan_x  = 0.0;
         _pan_y  = 0.0;
 
+        /* --- Phase 2: 3D mode --- */
+        _is_3d       = 0;
+        _3d_lock     = [[NSLock alloc] init];
+        _3d_payload  = nil;
+
         /* Coordinate readout label (top-right corner, hidden until cursor enters) */
         _coord_label = [[NSTextField alloc] initWithFrame:NSMakeRect(0,0,180,20)];
         [_coord_label setEditable:NO];
@@ -196,6 +232,8 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
     [_image release];
     [_lock  release];
     [_coord_label release];
+    [_3d_lock release];
+    [_3d_payload release];
     [super dealloc];
 }
 
@@ -226,6 +264,37 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
 - (void)sliderChanged:(NSSlider *)sender
 {
     _slider_send(self->win_id, (uint8_t)[sender tag], (float)[sender doubleValue]);
+}
+
+/* --- Phase 2: 3D mode ---
+ * Mirrors setImage:'s lock-copy-async pattern, but for the raw
+ * GSP_MSG_3D_FRAME payload instead of a decoded NSImage. Parsing
+ * (splitting into gsp_3d_line_t / gsp_3d_point_t records) happens in
+ * drawRect:/_draw3DFrame rather than here, matching how _project()/
+ * depth-sort already happen server(Perl)-side - this method only owns
+ * the bytes.
+ *
+ * FIXED (2026-06-20, persistent flicker): unlike setImage: (which is
+ * called directly from the reader thread and genuinely needs its own
+ * dispatch_async to reach the main thread), this method is only ever
+ * called from _update_window_3d's dispatch_async block - i.e. it is
+ * already running on the main thread by the time it gets here. The
+ * extra inner dispatch_async this used to have was a redundant re-hop:
+ * every frame got queued an extra tick behind the run loop, decoupling
+ * setNeedsDisplay: timing from the actual frame arrival and from each
+ * other when frames arrived faster than the queue drained - a likely
+ * contributor to the flicker that frame-rate limiting in GS3D.pm's
+ * run() loop did not fix on its own. setNeedsDisplay: is now called
+ * synchronously, in place, matching how Driver::GS3D actually delivers
+ * one frame at a time. */
+- (void)set3DPayload:(NSData *)payload
+{
+    [_3d_lock lock];
+    [_3d_payload release];
+    _3d_payload = [payload retain];
+    _is_3d = 1;
+    [_3d_lock unlock];
+    [self setNeedsDisplay:YES];
 }
 
 /* ---- coordinate helpers ------------------------------------------- */
@@ -276,6 +345,15 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
 {
     (void)dirtyRect;
 
+    /* --- Phase 2: 3D mode ---
+     * Completely different draw path, no PNG/letterbox involved.
+     * Checked first and returns early so the 2D NSImage path below
+     * never runs for a 3D window. */
+    if (_is_3d) {
+        [self _draw3DFrame];
+        return;
+    }
+
     /* white background */
     [[NSColor whiteColor] setFill];
     NSRectFill(self.bounds);
@@ -302,6 +380,156 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
             dst.origin.x + dst.size.width - lb.size.width - margin,
             dst.origin.y + dst.size.height - lb.size.height - margin)];
     }
+}
+
+/* --- Phase 2: 3D mode draw routine -------------------------------------
+ *
+ * Layout of the raw payload (see gsp_3d.h, numbers 0x24-0x27 after the
+ * collision fix with GSP_MSG_CLOSE/ACK):
+ *   gsp_3d_frame_hdr_t (13 bytes): n_lines(u16) n_points(u16) flags(u8)
+ *                                  cx(f32) cy(f32)
+ *   then n_lines * gsp_3d_line_t  (24 bytes each)
+ *   then n_points * gsp_3d_point_t (20 bytes each)
+ *
+ * Records arrive already depth-sorted back-to-front by Driver::GS3D
+ * (_send_3d_frame's $order = $depth->qsorti loop), so this method must
+ * NOT re-sort - it just strokes/fills in array order, preserving the
+ * painter's-algorithm ordering computed server-side.
+ *
+ * Y-axis: Driver::GS3D's _project() computes screen Y as
+ * "data_y * scale + cy" with cy = height/2, i.e. a top-down image
+ * convention (Y increases downward), same as the 2D PNG path's image
+ * coordinates. GsView's isFlipped is NO (Cocoa default, Y increases
+ * upward), so each Y coordinate is flipped here (view_h - y), mirroring
+ * how _viewPoint:toImageFx:fy: already flips Y for the 2D cursor path
+ * elsewhere in this class.
+ *
+ * UNCONFIRMED (flag for visual check once a 3D client is running):
+ * whether this flip direction actually matches what looks "upright" -
+ * if labels/axes appear upside-down, this is the first place to check. */
+- (void)_draw3DFrame
+{
+    [_3d_lock lock];
+    NSData *payload = [_3d_payload retain];
+    [_3d_lock unlock];
+
+    NSRect bounds = self.bounds;
+    float view_h  = (float)bounds.size.height;
+
+    /* dark background, distinct from the 2D viewer's white, so a 3D
+     * window is visually unmistakable even before any frame arrives */
+    [[NSColor colorWithCalibratedRed:0.08 green:0.08 blue:0.12 alpha:1.0] setFill];
+    NSRectFill(bounds);
+
+    if (!payload || [payload length] < sizeof(gsp_3d_frame_hdr_t)) {
+        [payload release];
+        return;
+    }
+
+    const uint8_t *buf = (const uint8_t *)[payload bytes];
+    size_t buflen = (size_t)[payload length];
+    gsp_3d_frame_hdr_t hdr;
+    memcpy(&hdr, buf, sizeof(hdr));
+    const uint8_t *p = buf + sizeof(hdr);
+
+    size_t need = sizeof(hdr)
+                + (size_t)hdr.n_lines  * sizeof(gsp_3d_line_t)
+                + (size_t)hdr.n_points * sizeof(gsp_3d_point_t);
+
+    if (buflen < need) {
+        /* truncated/corrupt payload: draw nothing rather than read OOB */
+        [payload release];
+        return;
+    }
+
+    CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
+
+    /* ---- lines (already back-to-front sorted by the server) ---- */
+    for (uint16_t i = 0; i < hdr.n_lines; i++) {
+        gsp_3d_line_t ln;
+        memcpy(&ln, p, sizeof(ln));
+        p += sizeof(ln);
+
+        CGContextSetRGBStrokeColor(ctx,
+            ln.r / 255.0f, ln.g / 255.0f, ln.b / 255.0f, ln.a / 255.0f);
+        CGContextSetLineWidth(ctx, 1.0f);
+        CGContextMoveToPoint(ctx, ln.x0, view_h - ln.y0);
+        CGContextAddLineToPoint(ctx, ln.x1, view_h - ln.y1);
+        CGContextStrokePath(ctx);
+    }
+
+    /* ---- points ---- */
+    for (uint16_t i = 0; i < hdr.n_points; i++) {
+        gsp_3d_point_t pt;
+        memcpy(&pt, p, sizeof(pt));
+        p += sizeof(pt);
+
+        float r = pt.size;
+        CGRect circle = CGRectMake(pt.x - r, view_h - pt.y - r, 2*r, 2*r);
+        CGContextSetRGBFillColor(ctx,
+            pt.r / 255.0f, pt.g / 255.0f, pt.b / 255.0f, pt.a / 255.0f);
+        CGContextFillEllipseInRect(ctx, circle);
+    }
+
+    /* --- Phase 2 (2026-06-21, label flicker fix): labels are parsed
+     * straight out of this same payload buffer, right after the point
+     * records - they are no longer a separate NSMutableArray populated
+     * by independent add3DLabel: calls. This is what makes the whole
+     * frame (lines+points+labels) a single atomic snapshot: payload is
+     * one NSData swapped in by exactly one set3DPayload: call, so there
+     * is no "halfway through adding labels" state for drawRect: to
+     * observe anymore (which was the actual cause of the flicker -
+     * labels.count was seen jumping 0,1,2,...,20 between frames).
+     *
+     * Layout (see gsp_3d.h): uint16_t n_labels, then n_labels records of
+     * (point_idx u16, x f32, y f32, r,g,b u8, len u8, text[len]). Bounds-
+     * checked defensively per-record since text length is attacker/bug
+     * controlled data coming off the wire - a malformed length must not
+     * walk `p` past the end of `buf`. */
+    if (buflen >= need + sizeof(uint16_t)) {
+        uint16_t n_labels;
+        memcpy(&n_labels, p, sizeof(n_labels));
+        p += sizeof(n_labels);
+
+        const uint8_t *end = buf + buflen;
+        for (uint16_t i = 0; i < n_labels; i++) {
+            /* fixed part: point_idx(u16) x(f32) y(f32) r,g,b(u8) len(u8) = 14 bytes */
+            if (p + 14 > end) break;   /* truncated: stop drawing labels, not a crash */
+
+            uint16_t point_idx; float lx, ly; uint8_t r, g, b, len;
+            memcpy(&point_idx, p,      2);
+            memcpy(&lx,        p + 2,  4);
+            memcpy(&ly,        p + 6,  4);
+            r   = p[10];
+            g   = p[11];
+            b   = p[12];
+            len = p[13];
+            p += 14;
+
+            if (p + len > end) break;  /* truncated text: stop here */
+
+            NSString *text = [[NSString alloc]
+                initWithBytes:p length:len encoding:NSUTF8StringEncoding];
+            p += len;
+
+            if (!text) continue;   /* invalid UTF-8: skip this label, keep going */
+
+            float draw_x = lx;
+            float draw_y = view_h - ly;
+            NSColor *color = [NSColor colorWithCalibratedRed:r/255.0f
+                                                         green:g/255.0f
+                                                          blue:b/255.0f
+                                                         alpha:1.0f];
+            NSDictionary *attrs = @{
+                NSFontAttributeName: [NSFont systemFontOfSize:11],
+                NSForegroundColorAttributeName: color,
+            };
+            [text drawAtPoint:NSMakePoint(draw_x, draw_y) withAttributes:attrs];
+            [text release];
+        }
+    }
+
+    [payload release];
 }
 
 /* ---- zoom / pan event handlers -------------------------------------- */
@@ -349,6 +577,22 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
 /* Double-click resets zoom/pan */
 - (void)mouseDown:(NSEvent *)event
 {
+    /* --- Phase 2: 3D mode ---
+     * Rotate-drag start. Double-click reset and the 2D pan/PICK logic
+     * below don't apply in 3D mode ('r'-key reset is handled by
+     * Driver::GS3D's run() loop on the 'r' key input, not here).
+     *
+     * makeFirstResponder: explicit here (rather than relying on
+     * NSWindow's implicit click-to-first-responder behavior) because
+     * this override never calls [super mouseDown:event], and p/r keys
+     * were observed not reaching keyDown: in testing even after a
+     * click - first-responder status not being reliably granted is the
+     * leading suspect. */
+    if (_is_3d) {
+        [[self window] makeFirstResponder:self];
+        _rot_drag_start = [self convertPoint:[event locationInWindow] fromView:nil];
+        return;
+    }
     if (event.clickCount == 2) {
         _zoom  = 1.0; _pan_x = 0.0; _pan_y = 0.0;
         _zoom_send(self->win_id, 1.0f, 0.0f, 0.0f);
@@ -371,6 +615,27 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
 
 - (void)mouseDragged:(NSEvent *)event
 {
+    /* --- Phase 2: 3D mode (トラックボール回転, 2026-06-21更新) ---
+     * 旧実装はここでドラッグ差分を「角度」(dtheta/dphi)に変換して
+     * 送っていたが、Perl側(GS3D.pm)がオイラー角2軸合成から回転行列
+     * 累積方式(トラックボール回転)に変わったため、Cocoa側はもう角度を
+     * 計算しない。生のドラッグ差分(画面px)をそのままGSP_MSG_3D_INPUTの
+     * dx/dyフィールドに乗せて送るだけにする - 軸の割り当て・感度係数の
+     * 計算は全てPerl側(_apply_drag_rotation)の責任にする。
+     *
+     * Y軸の向き(UNCONFIRMED): Cocoaのビュー座標はY-up(isFlipped==NO)。
+     * Perl側_apply_drag_rotationは「dy>0(上にドラッグ)→X軸回転+方向」
+     * という素朴な対応にしている。これが「上にドラッグ→奥が持ち上がる/
+     * 頭頂が手前に来る」という直感と一致するかは実機で確認が必要 -
+     * 違っていたらここでdyの符号を反転するのが直しやすい場所。 */
+    if (_is_3d) {
+        NSPoint cur = [self convertPoint:[event locationInWindow] fromView:nil];
+        float dx = (float)(cur.x - _rot_drag_start.x);
+        float dy = (float)(cur.y - _rot_drag_start.y);
+        _3d_input_send(self->win_id, dx, dy, 0.0f, /*type=drag*/0, /*key*/0);
+        _rot_drag_start = cur;
+        return;
+    }
     if (_zoom <= 1.0) return;   /* no pan when not zoomed */
     NSPoint cur = [self convertPoint:[event locationInWindow] fromView:nil];
     NSRect  dst = [self _plotDstRect];
@@ -419,6 +684,36 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
     [self setNeedsDisplay:YES];
 }
 
+/* --- Phase 2: 3D mode ---
+ * CONFIRMED MISSING (2026-06-20): the original 2D GsView never
+ * implemented keyDown: at all - acceptsFirstResponder/
+ * becomeFirstResponder return YES (so key events do reach this view),
+ * but with no keyDown: override, NSView's default just beeps/discards
+ * them. This is why pressing 'p'/'r' had no effect when tested - there
+ * was no code path sending GSP_MSG_3D_INPUT for a key event, unlike
+ * mouseDragged: which already had one. Only handled in 3D mode; 2D mode
+ * has no keyboard interaction so falls through to the default (which
+ * matches its prior - silent - behavior). */
+- (void)keyDown:(NSEvent *)event
+{
+    if (!_is_3d) { [super keyDown:event]; return; }
+
+    NSString *chars = [event charactersIgnoringModifiers];
+    if ([chars length] == 0) { [super keyDown:event]; return; }
+    unichar c = [chars characterAtIndex:0];
+
+    /* Only 'p'/'P' (toggle perspective) and 'r'/'R' (reset view) are
+     * meaningful to Driver::GS3D::run() (see its type==2 branch), so
+     * only those are forwarded - anything else falls through to the
+     * default responder-chain handling rather than being silently sent
+     * as a no-op 3D_INPUT. */
+    if (c == 'p' || c == 'P' || c == 'r' || c == 'R') {
+        _3d_input_send(self->win_id, 0.0f, 0.0f, 0.0f, /*type=key*/2, (uint8_t)c);
+        return;
+    }
+    [super keyDown:event];
+}
+
 - (BOOL)isFlipped { return NO; }   /* Cocoa default: origin bottom-left */
 
 @end /* GsView */
@@ -445,6 +740,7 @@ typedef struct {
     NSData         *last_png;     /* latest page PNG (owned copy, for saving) */
     char           *save_path;    /* pending vector-save destination (malloc'd, NULL if none) */
     uint8_t         save_fmt;     /* GSP_SAVE_FMT_* for the pending save  */
+    int             is_3d;        /* Phase 2: latched 1 on first GSP_MSG_3D_FRAME */
 } GsWindow;
 
 /* ------------------------------------------------------------------ */
@@ -832,6 +1128,20 @@ static BOOL _gsview_is_live(GsView *v)
 /* Menu bar - App menu (Quit) + File menu (Save as PNG / PDF / SVG)    */
 /* ------------------------------------------------------------------ */
 
+/* --- Build provenance (2026-06-20 added) -----------------------------
+ * __DATE__/__TIME__ are compiler-expanded at actual compile time, so
+ * this string is a ground-truth answer to "is this binary really from
+ * the source I think it is, and when was it actually compiled" - no
+ * trust in shell history, PATH order, or memory of which `make` ran
+ * last required. This was added after a real debugging session where
+ * `which giza_server` (and the implicit PATH/auto-start fallback in
+ * Driver::GS::_ensure_server) kept resolving to an old MacPorts/install
+ * copy at /usr/local/bin/giza_server instead of the freshly-built one
+ * in this repo, silently making every source edit a no-op for hours.
+ * Shown both at startup (stderr, visible immediately) and in the App
+ * menu (visible at any time without restarting). */
+#define GIZA_SERVER_BUILD_STAMP (__DATE__ " " __TIME__)
+
 static void _build_menu_bar(void)
 {
     NSMenu *menubar = [[NSMenu alloc] init];
@@ -842,6 +1152,19 @@ static void _build_menu_bar(void)
     [menubar addItem:app_item];
     NSMenu *app_menu = [[NSMenu alloc] init];
     [app_item setSubmenu:app_menu];
+
+    /* Disabled (non-clickable) info line showing build provenance.
+     * setEnabled:NO makes it visible-but-inert, the same "selectable but
+     * silent never happens" idea this file already uses for Save items
+     * - except here inverted on purpose: this one item is SUPPOSED to be
+     * inert, it exists only to be read. */
+    NSMenuItem *build_item = [[NSMenuItem alloc]
+        initWithTitle:[NSString stringWithFormat:@"Build: %s",
+                       GIZA_SERVER_BUILD_STAMP]
+               action:nil keyEquivalent:@""];
+    [build_item setEnabled:NO];
+    [app_menu addItem:build_item];
+    [app_menu addItem:[NSMenuItem separatorItem]];
 
     [app_menu addItemWithTitle:@"Quit giza_server"
                         action:@selector(terminate:)
@@ -874,6 +1197,12 @@ static void _build_menu_bar(void)
 
 void giza_server_cocoa_init(void)
 {
+    /* Print build provenance immediately, before anything else, so it's
+     * the first thing visible if the process is started from a terminal
+     * (see _build_menu_bar's comment for why this exists). */
+    fprintf(stderr, "giza_server (cocoa): build %s\n", GIZA_SERVER_BUILD_STAMP);
+    fflush(stderr);
+
     memset(&GS, 0, sizeof(GS));
     pthread_mutex_init(&GS.wins_lock, NULL);
     GS.listen_fd = -1;
@@ -902,6 +1231,7 @@ typedef struct {
     char title[256];
     int  result_id;           /* filled in by main-thread block       */
     dispatch_semaphore_t sem;
+    float sld_init[2];        /* normalized [0,1] initial slider positions (from NEWWIN) */
 } NewWinReq;
 
 static void _create_window_on_main(void *ptr)
@@ -968,30 +1298,34 @@ static void _create_window_on_main(void *ptr)
     [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [win.contentView addSubview:view];
 
-    /* Horizontal slider (tag=0, freq k): bottom, stops short of the right strip */
+    /* Horizontal slider (tag=0): bottom strip. Normalized [0,1]; the
+    * client assigns its meaning (e.g. time offset) in its render
+    * callback. Initial value from NEWWIN init records (default 0.0). */
     NSRect h_frame = NSMakeRect(8, 4,
                                 cb.size.width - slider_w - 16,
                                 slider_h - 8);
     NSSlider *hslider = [[NSSlider alloc] initWithFrame:h_frame];
-    [hslider setMinValue:0.5];
-    [hslider setMaxValue:8.0];
-    [hslider setDoubleValue:1.0];
-    [hslider setTag:0];                         /* k */
+    [hslider setMinValue:0.0];
+    [hslider setMaxValue:1.0];
+    [hslider setDoubleValue:req->sld_init[0]];
+    [hslider setTag:0];
     [hslider setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
     [hslider setContinuous:YES];
     [hslider setTarget:view];
     [hslider setAction:@selector(sliderChanged:)];
     [win.contentView addSubview:hslider];
 
-    /* Vertical slider (tag=1, amplitude A): right edge; width<height makes it vertical */
+    /* Vertical slider (tag=1): right strip. Normalized [0,1], min=bottom /
+     * max=top (NSSlider default). Client assigns meaning (e.g. gain);
+     * initial value from NEWWIN init records (default 0.0). */
     NSRect v_frame = NSMakeRect(cb.size.width - slider_w + 4, slider_h + 4,
                                 slider_w - 8,
                                 cb.size.height - slider_h - 8);
     NSSlider *vslider = [[NSSlider alloc] initWithFrame:v_frame];
-    [vslider setMinValue:0.1];
+    [vslider setMinValue:0.0];
     [vslider setMaxValue:1.0];
-    [vslider setDoubleValue:1.0];
-    [vslider setTag:1];                          /* A */
+    [vslider setDoubleValue:req->sld_init[1]];
+    [vslider setTag:1];
     [vslider setAutoresizingMask:NSViewMinXMargin | NSViewHeightSizable];
     [vslider setContinuous:YES];
     [vslider setTarget:view];
@@ -1051,13 +1385,16 @@ static void _create_window_on_main(void *ptr)
 
 
 static int _create_window_sync(int w_px, int h_px, const char *title,
-                               int client_fd, uint32_t group_id)
+                               int client_fd, uint32_t group_id,
+                               const float sld_init[2])
 {
     NewWinReq *req = calloc(1, sizeof(*req));
     req->suggested_w = w_px;
     req->suggested_h = h_px;
     req->client_fd   = client_fd;
     req->group_id    = group_id;
+    req->sld_init[0] = sld_init ? sld_init[0] : 0.0f;
+    req->sld_init[1] = sld_init ? sld_init[1] : 0.0f;
     strncpy(req->title, title ? title : "giza", sizeof(req->title) - 1);
     req->result_id = -1;
     req->sem = dispatch_semaphore_create(0);
@@ -1141,6 +1478,40 @@ static void _update_window(int win_id, const char *png_data, size_t png_len,
 
 
 
+}
+
+/* --- Phase 2: 3D mode ---
+ * GSP_MSG_3D_FRAME payload pass-through: unlike _update_window (which
+ * decodes PNG bytes into an NSImage), the 3D payload is opaque binary
+ * here and only gets parsed in GsView's drawRect:/_draw3DFrame. This
+ * function just owns a copy and hands it to the view on the main thread,
+ * mirroring _update_window's lock-and-dispatch shape.
+ *
+ * REVIEW NOTE (2026-06-21, label flicker fix): no longer calls
+ * clear3DLabels/add3DLabel: - labels are now part of `payload` itself
+ * (see gsp_3d.h, GS3D.pm's _send_3d_frame), so the single set3DPayload:
+ * call below replaces lines+points+labels together, atomically, exactly
+ * like it already did for lines+points alone. The previous design's
+ * separate clear/add steps (driven by now-retired GSP_MSG_3D_LABEL
+ * messages) are what let drawRect: observe a half-updated label set;
+ * folding labels into this one NSData removes that window entirely. */
+static void _update_window_3d(int win_id, const char *payload, size_t len)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive) return;
+
+    NSData *data = [[NSData alloc] initWithBytes:payload length:len];
+    GsView *view = w->view;
+    GsWindow *wptr = w;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        /* Re-check on the main thread: windowWillClose: may have run in
+         * the meantime (red-button close), same guard as _update_window. */
+        if (!wptr->alive || wptr->view != view) { [data release]; return; }
+        [view set3DPayload:data];
+        [data release];
+    });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1287,6 +1658,30 @@ static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y)
     pthread_mutex_unlock(&w->write_lock);
 }
 
+/* --- Phase 2: 3D mode (トラックボール回転, 2026-06-21更新) ---
+ * Same fd-sharing discipline as _slider_send/_zoom_send: serialized with
+ * the ACK path through write_lock, no-op if the client has gone. Called
+ * from GsView's mouseDragged: (main thread) for rotate-drag input.
+ * dx/dy are raw drag pixel deltas now (not angles) - see gsp_3d.h and
+ * GS3D.pm's _apply_drag_rotation for why. */
+static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
+                           uint8_t type, uint8_t key)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive || w->client_fd < 0) return;
+    gsp_3d_input_t body;
+    body.dx     = dx;
+    body.dy     = dy;
+    body.dzoom  = dzoom;
+    body.type   = type;
+    body.key    = key;
+    pthread_mutex_lock(&w->write_lock);
+    if (w->client_fd >= 0)
+        _send_msg(w->client_fd, GSP_MSG_3D_INPUT, w->seq_out++, &body, sizeof(body));
+    pthread_mutex_unlock(&w->write_lock);
+}
+
 /* Handle GSP_MSG_SAVEDATA from a client: find the window on this fd that
  * has a pending save (save_path set by the main thread in _vectorSave:)
  * and write the vector bytes to it.  Called from the per-connection
@@ -1405,9 +1800,27 @@ static void *_handle_connection(void *arg)
             gsp_newwin_t nw = {0, 0};
             if (payload && hdr.length >= sizeof(nw))
                 memcpy(&nw, payload, sizeof(nw));
+             /* Optional trailing gsp_slider_t[] after the 8-byte w/h:
+              * normalized [0,1] initial thumb positions, keyed by id.
+              * A plain 8-byte NEWWIN keeps both sliders at 0.0. */
+             float sld_init[2] = { 0.0f, 0.0f };
+             if (payload && hdr.length > sizeof(nw)) {
+                 size_t n = (hdr.length - sizeof(nw)) / sizeof(gsp_slider_t);
+                 const uint8_t *rp = (const uint8_t *)payload + sizeof(nw);
+                 for (size_t i = 0; i < n; i++) {
+                     gsp_slider_t si;
+                     memcpy(&si, rp + i * sizeof(gsp_slider_t), sizeof(si));
+                     if (si.slider_id < 2) {
+                         float v = si.value;
+                         if (v < 0.0f) v = 0.0f;
+                         if (v > 1.0f) v = 1.0f;
+                         sld_init[si.slider_id] = v;
+                     }
+                 }
+             }
             const char *ttl = title_buf[0] ? title_buf : "giza";
             current_win = _create_window_sync(nw.width_px, nw.height_px,
-                                              ttl, fd, peer_pid);
+                                              ttl, fd, peer_pid, sld_init);
             _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
             break;
         }
@@ -1432,9 +1845,11 @@ static void *_handle_connection(void *arg)
 
 
         case GSP_MSG_PNG: {
-
-            if (current_win < 0)
-                current_win = _create_window_sync(800, 600, "giza", fd, peer_pid);
+            if (current_win < 0) {
+                 static const float dflt_init[2] = { 0.0f, 0.0f };
+                 current_win = _create_window_sync(800, 600, "giza", fd,
+                                                   peer_pid, dflt_init);
+             }
             if (current_win >= 0) {
                 _update_window(current_win, payload, hdr.length, title_buf);
                 payload = NULL;
@@ -1442,6 +1857,41 @@ static void *_handle_connection(void *arg)
             _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
             break;
         }
+
+        /* --- Phase 2: 3D mode ---
+         * No auto-open fallback here (unlike PNG above): a 3D window
+         * must come from Driver::GS3D::run()'s explicit NEWWIN first, so
+         * current_win is always valid by the time a FRAME arrives. If a
+         * FRAME somehow arrives with current_win < 0, drop it silently
+         * rather than auto-creating a 2D-flavoured window that would
+         * never get its is_3d flag set.
+         *
+         * REVIEW NOTE (2026-06-21, label flicker fix): labels are now
+         * embedded in this FRAME payload itself (see gsp_3d.h's revised
+         * layout and GS3D.pm's _send_3d_frame) rather than sent as
+         * separate GSP_MSG_3D_LABEL messages (0x26, now retired). The
+         * old split-message design let drawRect: observe a half-built
+         * label set (clear3DLabels having run but not all of that
+         * frame's add3DLabel: calls yet) because each LABEL was its own
+         * dispatch_async block competing with the redraw's timing.
+         * _update_window_3d/set3DPayload: now hand the *entire* payload
+         * (lines + points + labels) to the view as one NSData, so
+         * _draw3DFrame parses and draws a fully-consistent snapshot -
+         * no separate clear/add steps, no partial-state window. */
+        case GSP_MSG_3D_FRAME: {
+            if (current_win >= 0) {
+                GS.wins[current_win].is_3d = 1;
+                _update_window_3d(current_win, payload, hdr.length);
+            }
+            _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
+            break;
+        }
+
+        /* 0x26 (旧GSP_MSG_3D_LABEL) は欠番。ラベルはFRAMEペイロードに
+         * 統合されたため、このメッセージタイプはもう送受信されない
+         * (gsp_3d.hのコメント参照)。古いクライアント/サーバーが万一
+         * これを送ってきても、switchのdefault節で「未知の型」として
+         * 安全に読み飛ばされる。 */
 
 
         case GSP_MSG_CLOSE:

@@ -78,8 +78,9 @@ window's figure at the new size on resize, rather than bitmap-scaling),
 **mouse zoom/pan and cursor/pick reporting** (`CURSOR`/`PICK`/`ZOOM`
 channels), per-PID tab grouping, and the close-signals-the-client lifecycle.
 The **Xlib** (Linux) viewer implements
-the `SLIDER` reverse channel (a bottom strip drives slider id 0 = k, a right
-strip drives id 1 = A; dragging sends the value to the client),
+the `SLIDER` reverse channel (a bottom strip drives slider id 0
+(horizontal), a right strip drives id 1 (vertical); dragging sends the
+slider's normalized [0,1] position to the client),
 **mouse zoom/pan and cursor/pick reporting** (wheel to zoom, drag to pan
 while zoomed, middle-click to reset), per-PID tab
 grouping (figures from the same client process share one window with a
@@ -136,7 +137,13 @@ typedef struct {
 | `PICK` | server→client | **none** (mouse click, image fraction) |
 
 `SLIDER` carries a 5-byte packed `gsp_slider_t` payload (`uint8_t` slider id
-+ `float` value), letting one message type drive any number of sliders.
++ `float` value), letting one message type drive any number of sliders. The
+value is **normalized `[0,1]`** — horizontal `0`=left..`1`=right, vertical
+`0`=bottom..`1`=top — and the client assigns each slider's meaning (time
+offset, gain, ...), mapping `[0,1]` to its own units; the viewer is
+value-domain agnostic. A `NEWWIN` may optionally carry trailing
+`gsp_slider_t` records giving each slider's initial thumb position, so a
+window opens with its thumbs already in the right place.
 
 `SAVEREQ`/`SAVEDATA` implement the **reverse-channel vector save**: when the
 user picks *Save as PDF/SVG* in the viewer, the server sends `SAVEREQ(fmt)`
