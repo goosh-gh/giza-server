@@ -13,11 +13,10 @@
 #
 # 依存: Wx (wxPerl), PDL
 
-use FindBin;
-use lib "$FindBin::Bin/wx/lib", "$FindBin::Bin/wx/arch";
-
 use strict;
 use warnings;
+use FindBin;
+use lib "$FindBin::Bin/wx/lib", "$FindBin::Bin/wx/arch";
 use Wx qw(:everything);
 use PDL;
 use PDL::Basic qw(sequence);
