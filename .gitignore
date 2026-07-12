@@ -58,7 +58,6 @@ client_mouse
 *.back
 /giza_server
 viewer/giza-server-osx-3d.m
-viewer/giza-server-xlib-3d.c
 tools/wx/
 download/
 .DS_Store
