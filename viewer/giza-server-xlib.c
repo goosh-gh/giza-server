@@ -29,6 +29,16 @@
 #include <cairo.h>
 #include <cairo-xlib.h>
 
+#include "gsp_3d.h"        /* Phase 2: 3D メッセージ型 (0x24-0x27) */
+
+/* giza-server-xlib-3d.c: 3D フレームを cairo で描く純粋関数。
+ * サーバ状態には触れない。Y は反転しない(cairo/X11 と Driver::GS3D の
+ * _project は同じ「Y 下向き」規約。Cocoa 版だけが NSView の isFlipped=NO
+ * のために反転しており、あれを移植すると上下逆になる)。 */
+extern void gsp3d_draw_cairo(cairo_t *cr, double ox, double oy,
+                             double vw, double vh,
+                             const unsigned char *buf, size_t len);
+
 #include <png.h>
 
 #include <stdio.h>
@@ -94,6 +104,7 @@ typedef enum {
     CMD_TITLE,     /* set window title                                */
     CMD_CLOSE,     /* close a window                                  */
     CMD_SAVEPATH,  /* write vector bytes (SAVEDATA) to disk           */
+    CMD_3D_FRAME,  /* Phase 2: raw GSP_MSG_3D_FRAME payload            */
 } CmdType;
 
 typedef struct {
@@ -108,6 +119,8 @@ typedef struct {
     char             save_path[512];              /* CMD_SAVEPATH      */
     unsigned char   *save_bytes;                  /* CMD_SAVEPATH      */
     size_t           save_len;                    /* CMD_SAVEPATH      */
+    unsigned char   *p3d;                         /* CMD_3D_FRAME (malloc'd, handed off) */
+    size_t           p3d_len;                     /* CMD_3D_FRAME      */
     int             *result;                      /* optional reply slot */
     pthread_mutex_t *result_mu;
     pthread_cond_t  *result_cv;
@@ -154,6 +167,14 @@ typedef struct {
 
     /* Interactive slider values (main-thread only). [0]=k, [1]=A.      */
     double           sld_val[2];
+
+    /* Phase 2 (3D). is_3d は最初の GSP_MSG_3D_FRAME でラッチする
+     * (NEWWIN に 3D フラグを載せる案は未実装。Cocoa 版の GsWindow.is_3d と
+     *  同じ規約で揃えてある)。p3d は main スレッドのみが読み書きする:
+     * 接続スレッドは payload を Cmd に載せて渡すだけで、直接触らない。 */
+    int              is_3d;
+    unsigned char   *p3d;          /* 最新フレームの生ペイロード (malloc'd) */
+    size_t           p3d_len;
 } GsWindow;
 
 /* A GsContainer owns one X top-level window and groups 1..N tabs (figures)
@@ -368,10 +389,14 @@ static int _create_container(uint32_t gid, int w, int h)
             WhitePixel(GS.dpy, GS.screen));
         XSetWMProtocols(GS.dpy, c->xwin, &GS.wm_delete, 1);
         c->gc = XCreateGC(GS.dpy, c->xwin, 0, NULL);
+        /* KeyPressMask は Phase 2 で追加。それまで Xlib ビューアはキー入力を
+         * 一切拾っていなかった(= 3D の 'r' リセット / 'p' 透視切替が存在
+         * しなかった)。Cocoa 版は keyDown: で既に対応済み。 */
         XSelectInput(GS.dpy, c->xwin,
                      ExposureMask | StructureNotifyMask |
                      ButtonPressMask | Button1MotionMask |
-                     ButtonReleaseMask | PointerMotionMask);
+                     ButtonReleaseMask | PointerMotionMask |
+                     KeyPressMask);
         XMapRaised(GS.dpy, c->xwin);
         return i;
     }
@@ -615,7 +640,14 @@ _repaint_container(GsContainer *c)
     int bx, by, bw, bh;
     _body_geom(c, n, &bx, &by, &bw, &bh);
 
-    if (win && win->surface) {
+    /* Phase 2: 3D タブは PNG サーフェスを持たない。ペイロードを cairo で
+     * 直接描く。スライダ帯は 3D では意味がないので出さない(タブバーは
+     * 下の共通処理でそのまま描かれる)。 */
+    if (win && win->is_3d) {
+        gsp3d_draw_cairo(cr, (double)bx, (double)by,
+                             (double)bw, (double)bh,
+                             win->p3d, win->p3d_len);
+    } else if (win && win->surface) {
         /* Letterbox + zoom/pan: scale image to fit plot area, then apply zoom. */
         int    iw   = cairo_image_surface_get_width(win->surface);
         int    ih   = cairo_image_surface_get_height(win->surface);
@@ -695,6 +727,10 @@ _close_tab(int id, int user_initiated)
     if (win->surface) { cairo_surface_destroy(win->surface); win->surface = NULL; }
     free(win->save_path);
     win->save_path = NULL;
+    free(win->p3d);               /* Phase 2: 最新 3D フレーム */
+    win->p3d       = NULL;
+    win->p3d_len   = 0;
+    win->is_3d     = 0;
     pthread_mutex_destroy(&win->write_lock);
     win->alive     = 0;
     win->container = -1;
@@ -748,6 +784,26 @@ _dispatch(Cmd *cmd)
         _open_window(cmd->win_id, cmd->fd, cmd->width, cmd->height,
                      cmd->title, cmd->group_id);
         break;
+
+    case CMD_3D_FRAME: {
+        /* main スレッド側。接続スレッドが malloc したペイロードの所有権を
+         * ここで引き取り、直前のフレームを解放して差し替える。フレーム全体
+         * (線分+点+ラベル)が 1 個のバッファなので、描画側は常に一貫した
+         * スナップショットを見る(Phase 1 のラベルちらつき対策と同じ理屈)。 */
+        GsWindow *w3 = _find_or_create_win(cmd->win_id);
+        if (w3) {
+            free(w3->p3d);
+            w3->p3d     = cmd->p3d;      /* 所有権移譲 */
+            w3->p3d_len = cmd->p3d_len;
+            w3->is_3d   = 1;             /* 初回フレームでラッチ */
+            cmd->p3d    = NULL;
+            if (w3->container >= 0 && GS.conts[w3->container].alive)
+                _repaint_container(&GS.conts[w3->container]);
+        } else {
+            free(cmd->p3d);
+        }
+        break;
+    }
 
     case CMD_PNG:
         win = _find_or_create_win(cmd->win_id);
@@ -860,6 +916,42 @@ _zoom_send_xlib(GsWindow *win, float zoom, float pan_x, float pan_y)
             _write_exact(fd, &body, sizeof(body));
     }
     pthread_mutex_unlock(&win->write_lock);
+}
+
+/* Phase 2: 3D 入力の逆送信。_zoom_send_xlib と同じ規約(win->write_lock で
+ * 直列化し、ヘッダ+ボディを続けて書く)。dx/dy は「生のドラッグ画素差分」で
+ * あって角度ではない —— Driver::GS3D の _apply_drag_rotation がこれを
+ * クォータニオンの微小回転に変換する(2026-06-21 に dtheta/dphi から改名)。
+ * type: 0=drag 1=wheel 2=key。Cocoa 版 _3d_input_send と同じ番号。 */
+static void
+_3d_input_send_xlib(GsWindow *win, float dx, float dy, float dzoom,
+                    uint8_t type, uint8_t key)
+{
+    if (!win) return;
+    pthread_mutex_lock(&win->write_lock);
+    int fd = win->client_fd;
+    if (fd >= 0) {
+        gsp_3d_input_t body;
+        memset(&body, 0, sizeof(body));
+        body.dx    = dx;
+        body.dy    = dy;
+        body.dzoom = dzoom;
+        body.type  = type;
+        body.key   = key;
+        if (_send_hdr(fd, GSP_MSG_3D_INPUT, (uint32_t)sizeof(body), 0) == 0)
+            _write_exact(fd, &body, sizeof(body));
+    }
+    pthread_mutex_unlock(&win->write_lock);
+}
+
+/* コンテナのアクティブタブ(3D なら非 NULL)。3D 分岐の共通ヘルパ。 */
+static GsWindow *
+_active_3d_win(GsContainer *c)
+{
+    if (!c || c->active < 0) return NULL;
+    GsWindow *w = &GS.wins[c->active];
+    if (!w->alive || !w->is_3d) return NULL;
+    return w;
 }
 
 /* Convert container-local event coords to image fractions [0,1].
@@ -982,6 +1074,34 @@ _handle_xevent(XEvent *ev)
         int tabs[MAX_WINDOWS];
         int n = _container_tabs((int)(c - GS.conts), tabs, MAX_WINDOWS);
 
+        /* Phase 2: 3D タブではホイールもドラッグもクライアントへ転送する。
+         * サーバ側の 2D zoom/pan 状態(c->zoom, c->pan_*)は 3D では意味が
+         * なく、姿勢と倍率は Driver::GS3D 側の {qrot}/{zoom} が持つため。 */
+        {
+            GsWindow *w3 = _active_3d_win(c);
+            if (w3) {
+                if (ev->xbutton.button == Button4 ||
+                    ev->xbutton.button == Button5) {
+                    /* X11 のホイールは Button4(up)/Button5(down)。GS3D の
+                     * run() は {zoom} *= (1 + dzoom*0.1) を掛けるので、
+                     * ±1.0 で 1 ノッチ約 10%。 */
+                    float dz = (ev->xbutton.button == Button4) ? 1.0f : -1.0f;
+                    _3d_input_send_xlib(w3, 0.0f, 0.0f, dz, /*wheel*/1, 0);
+                    break;
+                }
+                if (ev->xbutton.button == Button1) {
+                    c->dragging = 1;                 /* 3D は常にドラッグ可 */
+                    c->drag_x   = ev->xbutton.x;
+                    c->drag_y   = ev->xbutton.y;
+                    break;
+                }
+                if (ev->xbutton.button == Button2) { /* 中クリック = リセット */
+                    _3d_input_send_xlib(w3, 0.0f, 0.0f, 0.0f, /*key*/2, (uint8_t)'r');
+                    break;
+                }
+            }
+        }
+
         /* Scroll wheel (Button4 = up, Button5 = down) → zoom about centre. */
         if (ev->xbutton.button == Button4 || ev->xbutton.button == Button5) {
             double factor = (ev->xbutton.button == Button4) ? 1.1 : (1.0 / 1.1);
@@ -1055,6 +1175,21 @@ _handle_xevent(XEvent *ev)
         break;
     }
 
+    /* Phase 2: キー入力。Xlib ビューアは従来キーを一切扱っていなかった。
+     * 3D タブでのみクライアントへ転送する('r' = canonical へリセット、
+     * 'p' = 透視/正射 切替。Driver::GS3D::run() の分岐を参照)。 */
+    case KeyPress: {
+        GsContainer *c = _container_for_xwin(ev->xkey.window);
+        GsWindow *w3 = _active_3d_win(c);
+        if (!w3) break;
+        char   buf[8];
+        KeySym ks;
+        int n = XLookupString(&ev->xkey, buf, sizeof(buf), &ks, NULL);
+        if (n > 0)
+            _3d_input_send_xlib(w3, 0.0f, 0.0f, 0.0f, /*key*/2, (uint8_t)buf[0]);
+        break;
+    }
+
     case ButtonRelease: {
         GsContainer *c = _container_for_xwin(ev->xbutton.window);
         if (c && c->dragging) {
@@ -1072,6 +1207,22 @@ _handle_xevent(XEvent *ev)
         if (!c) break;
         int tabs[MAX_WINDOWS];
         int n = _container_tabs((int)(c - GS.conts), tabs, MAX_WINDOWS);
+
+        /* Phase 2: 3D タブは「前回位置からの画素差分」を毎回送る。
+         * 累積角ではなく差分なので、drag_x/drag_y は送るたびに更新する
+         * (2D の drag-pan が pan_x0 からの絶対差分を使うのとは異なる)。 */
+        {
+            GsWindow *w3 = _active_3d_win(c);
+            if (w3 && c->dragging && (ev->xmotion.state & Button1Mask)) {
+                float dx = (float)(ev->xmotion.x - c->drag_x);
+                float dy = (float)(ev->xmotion.y - c->drag_y);
+                c->drag_x = ev->xmotion.x;
+                c->drag_y = ev->xmotion.y;
+                if (dx != 0.0f || dy != 0.0f)
+                    _3d_input_send_xlib(w3, dx, dy, 0.0f, /*drag*/0, 0);
+                break;
+            }
+        }
 
         /* Drag-pan: Button1 held outside slider strips while zoomed. */
         if (c->dragging && (ev->xmotion.state & Button1Mask)) {
@@ -1202,6 +1353,28 @@ _connection_thread(void *arg)
             cmd->type    = CMD_PNG;
             cmd->win_id  = wid;
             cmd->surface = surf;
+            _send_cmd(cmd);
+            _send_hdr_locked(wid, fd, GSP_MSG_ACK, 0, seq_out++);
+            break;
+        }
+
+        /* Phase 2: 3D フレーム。
+         *
+         * ACK は必須。Driver::GS3D の run() は _send_3d_frame のたびに
+         * _recv_ack_3d で ACK を待つので、ここで返さないとクライアントが
+         * 1 枚目の送信後に永久ブロックし、窓が白いまま固まる(Xlib が
+         * 3D を描かなかった当初の症状はこれが原因)。Cocoa 版の
+         * case GSP_MSG_3D_FRAME も同様に ACK を返している。 */
+        case GSP_MSG_3D_FRAME: {
+            Cmd *cmd = calloc(1, sizeof(Cmd));
+            if (!cmd) { free(payload); goto done; }
+            unsigned char *copy = malloc(len ? len : 1);
+            if (!copy) { free(cmd); free(payload); goto done; }
+            memcpy(copy, payload, len);
+            cmd->type    = CMD_3D_FRAME;
+            cmd->win_id  = wid;
+            cmd->p3d     = copy;
+            cmd->p3d_len = len;
             _send_cmd(cmd);
             _send_hdr_locked(wid, fd, GSP_MSG_ACK, 0, seq_out++);
             break;

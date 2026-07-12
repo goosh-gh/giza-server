@@ -36,7 +36,9 @@ endif
 if USE_XLIB
 giza_server_SOURCES = \
     viewer/giza-server-xlib.c \
-    viewer/giza-server-protocol.h
+    viewer/giza-server-xlib-3d.c \
+    viewer/giza-server-protocol.h \
+    viewer/gsp_3d.h
 
 giza_server_CFLAGS  = \
     -I$(srcdir)/viewer \
@@ -56,7 +58,8 @@ if USE_COCOA
 giza_server_SOURCES = \
     viewer/giza-server-cocoa.m \
     viewer/giza-server-main.m \
-    viewer/giza-server-protocol.h
+    viewer/giza-server-protocol.h \
+    viewer/gsp_3d.h
 # -x objective-c is embedded in COCOA_CFLAGS from configure.ac
 giza_server_CFLAGS  = \
     -I$(srcdir)/viewer \
