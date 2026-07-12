@@ -71,6 +71,7 @@
 
 #import <Cocoa/Cocoa.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#include <math.h>        /* fabsf: 3D入力の微小デルタ判定 */
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -540,6 +541,29 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
 
 - (void)magnifyWithEvent:(NSEvent *)event
 {
+    /* --- Phase 2: 3D mode (2026-07-12) ---
+     * 3Dでは _zoom / _pan_x / _pan_y (このビューが持つ2D用の状態)は誰も
+     * 見ない。姿勢と倍率は Perl 側 Driver::GS3D の {qrot}/{zoom} が持ち、
+     * クライアントは送られてきたフレームを描くだけだからである。したがって
+     * ピンチはローカルで消化せず、dzoom として GSP_MSG_3D_INPUT で転送する。
+     *
+     * この分岐が無かったために「2Dではズームできるのに3Dでは効かない」
+     * という症状が出ていた(keyDown:/mouseDragged: はPhase 1で3D対応済み
+     * だったが、ホイール/ピンチだけが取り残されていた)。Xlibビューアは
+     * 先行して結線済み(giza-server-xlib.c の ButtonPress/Button4|5)。
+     *
+     * スケール: GS3D.pm の run() は {zoom} *= (1 + dzoom*0.1) を掛ける。
+     * event.magnification は 1ジェスチャあたり概ね 0.01〜0.1 程度なので、
+     * 10倍して渡すと zoom *= (1 + magnification) と素直に対応する。
+     * (GS3D側は abs(dzoom) > 0.01 を閾値にしているので、微小ノイズは無視
+     *  される。)手触りが合わなければこの係数が調整ノブ。 */
+    if (_is_3d) {
+        float dz = (float)(event.magnification * 10.0);
+        if (fabsf(dz) > 0.0f)
+            _3d_input_send(self->win_id, 0.0f, 0.0f, dz, /*type=wheel*/1, /*key*/0);
+        return;                    /* 2D の _zoom/_pan には触れない */
+    }
+
     /* Pinch gesture or Ctrl+two-finger-scroll on a trackpad */
     _zoom *= (1.0 + event.magnification);
     if (_zoom < 1.0) { _zoom = 1.0; _pan_x = 0.0; _pan_y = 0.0; }
@@ -550,6 +574,23 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
 
 - (void)scrollWheel:(NSEvent *)event
 {
+    /* --- Phase 2: 3D mode (2026-07-12) ---
+     * magnifyWithEvent: と同じ理由で、3Dではローカルの _zoom を動かさず
+     * dzoom を転送する。2D側の「Ctrl+scroll=zoom / 素のscroll=pan」という
+     * 使い分けは3Dには持ち込まない: 3Dのpanはまだ両側とも未実装で
+     * (_project に平行移動オフセットが無い)、素のホイールを常にズームに
+     * 割り当てる方が Xlib ビューア(Button4/5 = ズーム)と挙動が揃う。
+     *
+     * スケール: 2D側が scrollingDeltaY * 0.05 を「倍率の増分」として使って
+     * いるのに合わせ、GS3D の (1 + dzoom*0.1) に同じ増分が渡るよう 0.5 倍
+     * して送る(1ノッチ ≒ 5%)。手触りの調整ノブはここ。 */
+    if (_is_3d) {
+        float dz = (float)(event.scrollingDeltaY * 0.5);
+        if (fabsf(dz) > 0.0f)
+            _3d_input_send(self->win_id, 0.0f, 0.0f, dz, /*type=wheel*/1, /*key*/0);
+        return;                    /* 2D の _zoom/_pan には触れない */
+    }
+
     if (event.modifierFlags & NSEventModifierFlagControl) {
         /* Ctrl + scroll = zoom */
         double delta = event.scrollingDeltaY * 0.05;
