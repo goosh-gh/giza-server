@@ -1215,13 +1215,10 @@ _handle_xevent(XEvent *ev)
             GsWindow *w3 = _active_3d_win(c);
             if (w3 && c->dragging && (ev->xmotion.state & Button1Mask)) {
                 float dx = (float)(ev->xmotion.x - c->drag_x);
-/*                float dy = (float)(ev->xmotion.y - c->drag_y); */
-                /* dy の符号規約: X11 の画面 y は「下が正」だが、Cocoa の
-                 * mouseDragged: は isFlipped=NO のため「上が正」で送っている。
-                 * ワイヤ上の dy は Cocoa 側を正とするので、ここで反転して
-                 * 規約を揃える。こうしないと Driver::GS3D の DRAG_DY_SIGN が
-                 * OS ごとに逆の意味を持ってしまい、片方を直すと他方が壊れる。
-                 * (2026-07-12: Ubuntu だけ縦ドラッグが逆回転した実機報告への対処) */
+                /* X11 の画面 y は「下が正」。ワイヤ上の dy は Cocoa の
+                 * isFlipped=NO 由来で「上が正」を正とするため、ここで反転して
+                 * 規約を揃える。これを怠ると Driver::GS3D の DRAG_DY_SIGN が
+                 * OS ごとに逆の意味になり、片方を直すと他方が壊れる。 */
                 float dy = -(float)(ev->xmotion.y - c->drag_y);
                 c->drag_x = ev->xmotion.x;
                 c->drag_y = ev->xmotion.y;
