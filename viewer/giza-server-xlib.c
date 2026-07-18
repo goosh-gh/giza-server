@@ -82,10 +82,10 @@ extern void gsp3d_draw_cairo(cairo_t *cr, double ox, double oy,
  * sends GSP_MSG_SLIDER(id, value) back to the window's client. */
 #define SLIDER_H        28          /* bottom strip height (horizontal, id 0) */
 #define SLIDER_W        28          /* right  strip width  (vertical,   id 1) */
-#define SLD_K_MIN       0.5         /* id 0 (k) range — matches Cocoa */
-#define SLD_K_MAX       8.0
-#define SLD_A_MIN       0.1         /* id 1 (A) range — matches Cocoa */
-#define SLD_A_MAX       1.0
+/* Slider values on the wire are NORMALISED [0,1] (see GS.pm: "val は正規化
+ * [0,1]"). The client maps [0,1] to its own units; the server must not bake in
+ * an application range here (doing so is what made the Xlib backend send
+ * 0.5..8.0 while Cocoa sent 0..1). */
 #define TWO_PI          6.283185307179586
 
 /* ------------------------------------------------------------------ */
@@ -448,8 +448,8 @@ _open_window(int id, int client_fd, int w, int h, const char *title,
     win->client_fd  = client_fd;   /* this tab's own client socket */
     win->savereq_wr = -1;
     pthread_mutex_init(&win->write_lock, NULL);
-    win->sld_val[0] = 1.0;   /* k initial (matches Cocoa) */
-    win->sld_val[1] = 1.0;   /* A initial                 */
+    win->sld_val[0] = 0.0;   /* normalised [0,1]; time slider starts at left  */
+    win->sld_val[1] = 0.5;   /* normalised [0,1]; neutral until first drag    */
     snprintf(win->title, sizeof(win->title), "%s", title[0] ? title : "giza");
 
     GS.conts[ci].active = slot;    /* newly opened tab is shown */
@@ -499,7 +499,7 @@ _draw_sliders(cairo_t *cr, GsWindow *win, int bx, int by, int bw, int bh)
     cairo_move_to(cr, 8.0, cyh);
     cairo_line_to(cr, pw - 8.0, cyh);
     cairo_stroke(cr);
-    double kf = (win->sld_val[0] - SLD_K_MIN) / (SLD_K_MAX - SLD_K_MIN);
+    double kf = win->sld_val[0];              /* already normalised [0,1] */
     cairo_set_source_rgb(cr, 0.20, 0.40, 0.80);
     cairo_arc(cr, 8.0 + kf * (pw - 16.0), cyh, 7.0, 0.0, TWO_PI);
     cairo_fill(cr);
@@ -510,7 +510,7 @@ _draw_sliders(cairo_t *cr, GsWindow *win, int bx, int by, int bw, int bh)
     cairo_move_to(cr, cxv, 8.0);
     cairo_line_to(cr, cxv, ph - 8.0);
     cairo_stroke(cr);
-    double af = (win->sld_val[1] - SLD_A_MIN) / (SLD_A_MAX - SLD_A_MIN);
+    double af = win->sld_val[1];              /* already normalised [0,1] */
     cairo_set_source_rgb(cr, 0.20, 0.40, 0.80);
     cairo_arc(cr, cxv, 8.0 + (1.0 - af) * (ph - 16.0), 7.0, 0.0, TWO_PI);
     cairo_fill(cr);
@@ -1005,16 +1005,14 @@ _slider_input(GsWindow *win, int bx, int by, int bw, int bh, int ex, int ey)
 
     if (y >= ph && x <= pw) {                 /* bottom strip → k (id 0) */
         double frac = _clampd(((double)x - 8.0) / (pw - 16.0), 0.0, 1.0);
-        double val  = SLD_K_MIN + frac * (SLD_K_MAX - SLD_K_MIN);
-        win->sld_val[0] = val;
+        win->sld_val[0] = frac;               /* store & send normalised [0,1] */
         if (c) _repaint_container(c);
-        _slider_send(win, 0, (float)val);
+        _slider_send(win, 0, (float)frac);
     } else if (x >= pw && y <= ph) {          /* right strip → A (id 1) */
         double frac = _clampd(1.0 - ((double)y - 8.0) / (ph - 16.0), 0.0, 1.0);
-        double val  = SLD_A_MIN + frac * (SLD_A_MAX - SLD_A_MIN);
-        win->sld_val[1] = val;
+        win->sld_val[1] = frac;               /* store & send normalised [0,1] */
         if (c) _repaint_container(c);
-        _slider_send(win, 1, (float)val);
+        _slider_send(win, 1, (float)frac);
     }
 }
 
