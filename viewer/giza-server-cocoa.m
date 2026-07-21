@@ -138,6 +138,7 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
     NSLock   *_3d_lock;
     NSData   *_3d_payload;       /* raw GSP_MSG_3D_FRAME payload (lines+points+labels), parsed in drawRect: */
     NSPoint   _rot_drag_start;   /* mouseDown point, 3D-rotate drag (separate from 2D _drag_start) */
+    NSPoint   _3d_down_point;    /* 3D mouseDown point, to tell a click (pick) from a rotate-drag */
 }
 - (void)setImage:(NSImage *)img;
 - (void)sliderChanged:(NSSlider *)sender;
@@ -632,6 +633,7 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
     if (_is_3d) {
         [[self window] makeFirstResponder:self];
         _rot_drag_start = [self convertPoint:[event locationInWindow] fromView:nil];
+        _3d_down_point  = _rot_drag_start;   /* remember start to tell click (pick) from drag */
         return;
     }
     if (event.clickCount == 2) {
@@ -693,6 +695,31 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
 
 - (void)mouseUp:(NSEvent *)event
 {
+    /* --- Phase 2: 3D mode ---
+     * A press-release with little movement is a *click* (pick a source
+     * vertex), not a rotate-drag. Send GSP_MSG_PICK with the click as a
+     * fraction of the *full view* (the 3D frame is drawn over the whole
+     * bounds, not the 2D letterbox rect, so we don't use _viewPoint:).
+     * Driver::GS3D's _recv_ack_3d picks the nearest visible mesh vertex. */
+    if (_is_3d) {
+        NSPoint up = [self convertPoint:[event locationInWindow] fromView:nil];
+        double mdx = up.x - _3d_down_point.x;
+        double mdy = up.y - _3d_down_point.y;
+        if (mdx*mdx + mdy*mdy <= 9.0) {          /* < 3px travel = click */
+            NSRect b = [self bounds];
+            if (b.size.width > 0 && b.size.height > 0) {
+                float fx = (float)((up.x - b.origin.x) / b.size.width);
+                /* Cocoa y up; image y down — flip */
+                float fy = (float)(1.0 - (up.y - b.origin.y) / b.size.height);
+                if (fx >= 0.0f && fx <= 1.0f && fy >= 0.0f && fy <= 1.0f) {
+                    uint8_t btn = (uint8_t)([event buttonNumber] + 1);
+                    _cursor_send(self->win_id, fx, fy, btn, GSP_MSG_PICK);
+                }
+            }
+        }
+        return;
+    }
+
     (void)event;
     if (_zoom > 1.0)
         _zoom_send(self->win_id, (float)_zoom, (float)_pan_x, (float)_pan_y);
@@ -703,6 +730,22 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
 - (void)mouseMoved:(NSEvent *)event
 {
     NSPoint pt = [self convertPoint:[event locationInWindow] fromView:nil];
+    /* --- 3D: send cursor as a fraction of the *full view* (matches the 3D
+     * frame's full-bounds coords). Driver::GS3D turns this into a live
+     * readout (MNI x,y,z + cortical area) on the Perl side, so hide the
+     * server's own 2D fx/fy label here. --- */
+    if (_is_3d) {
+        NSRect b = [self bounds];
+        if (b.size.width > 0 && b.size.height > 0) {
+            float fx = (float)((pt.x - b.origin.x) / b.size.width);
+            float fy = (float)(1.0 - (pt.y - b.origin.y) / b.size.height);
+            if (fx >= 0.0f && fx <= 1.0f && fy >= 0.0f && fy <= 1.0f)
+                _cursor_send(self->win_id, fx, fy, 0, GSP_MSG_CURSOR);
+        }
+        [_coord_label setHidden:YES];
+        return;
+    }
+
     double fx, fy;
     BOOL inside = [self _viewPoint:pt toImageFx:&fx fy:&fy];
     [_coord_label setHidden:!inside];
