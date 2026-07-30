@@ -76,7 +76,8 @@ interactive set: `SLIDER` reverse channel, `File ▸ Save` (PNG and
 reverse-channel PDF/SVG), `RESIZE` resize replot (re-renders an interactive
 window's figure at the new size on resize, rather than bitmap-scaling),
 **mouse zoom/pan and cursor/pick reporting** (`CURSOR`/`PICK`/`ZOOM`
-channels), per-PID tab grouping, and the close-signals-the-client lifecycle.
+channels), per-PID tab grouping, **3D frame rendering** (mesh z-buffer Gouraud
+rasteriser — see "3D frame rendering" below), and the close-signals-the-client lifecycle.
 The **Xlib** (Linux) viewer implements
 the `SLIDER` reverse channel (a bottom strip drives slider id 0
 (horizontal), a right strip drives id 1 (vertical); dragging sends the
@@ -114,7 +115,8 @@ typedef struct {
     uint32_t magic;    /* 0x47495A41 "GIZA" */
     uint8_t  version;
     uint8_t  type;     /* PNG, NEWWIN, CLOSE, PING/PONG, TITLE, SLIDER,
-                          SAVEREQ, SAVEDATA, RESIZE, ZOOM, CURSOR, PICK ... */
+                          SAVEREQ, SAVEDATA, RESIZE, ZOOM, CURSOR, PICK,
+                          3D_FRAME ... */
     uint16_t flags;
     uint32_t length;   /* payload bytes */
     uint32_t seq;
@@ -182,6 +184,23 @@ All three are fire-and-forget (`gsp_cursor_t` is a 9-byte packed
 `float`s). Each is optional on the client side — `Driver::GS` invokes the
 matching callback (`on_cursor` / `on_pick` / `on_zoom`) only if one was
 registered, and otherwise consumes and ignores the message.
+
+### 3D frame rendering
+
+Besides 2D PNG blits, the server can render 3D frames sent as a `3D_FRAME`
+message (`GSP_MSG_3D_FRAME`; payload layout in `viewer/gsp_3d.h`). One frame
+carries lines, points, labels, and triangles in screen coordinates:
+
+- **Triangles** are drawn by a software **z-buffer Gouraud rasteriser**
+  (per-vertex colour interpolation, correct depth occlusion, smooth shading).
+- **Lines** are drawn as 1-pixel strokes, or — for horizontal scanline-fill
+  spans — as filled bars ("thick-fill"), selected by a frame flag.
+- **Points** are drawn as markers and **labels** as text; mouse picks and
+  cursor position over the 3D view are reported back to the client.
+
+This path is driven by `PDL::Graphics::Cairo`'s `Driver::GS3D`. It is
+implemented in the **Cocoa** (macOS) viewer only; the Xlib and GTK viewers do
+not render 3D frames.
 
 ### Mouse interaction (user controls)
 
