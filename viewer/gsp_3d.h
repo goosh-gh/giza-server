@@ -25,6 +25,16 @@
  * 完全なフレームがアトミックに反映される」という保証がラベルにも及ぶ。
  * GSP_MSG_3D_LABEL (旧0x26) は欠番として予約し、再利用しない。
  *
+ * REVIEW NOTE 3 (2026-07-23, thick-fill: 拡大時の横縞除去): メッシュの
+ * スキャンライン塗りは水平span(y0==y1)の並びだが、拡大でstep(行間隔)が
+ * 1pxを超えると1px strokeでは行間に隙間が残り横縞になる。対策として
+ * hdr.flags bit2 (0x04) を立て、水平fill線の depth フィールドを「帯の高さ
+ * (=ceil(step))」として読み替え、クライアントはその高さのfilled rectで
+ * 塗る(行が隙間なくタイル化される)。非水平線(軸/ワイヤ)とflag off時は従来
+ * 通り1px stroke。depthは元々ソート参照専用でソートはPerl側で適用済み
+ * =描画では未使用なので、struct/レイアウトは一切変えずに読み替えできる。
+ * 旧クライアントはbit2もdepthも無視して1px strokeに落ちる(後方互換)。
+ *
  * 既存の gsp.h に追記するか #include "gsp_3d.h" で取り込む。
  */
 #ifndef GSP_3D_H
@@ -48,7 +58,9 @@
  * ヘッダ (13 bytes):
  *   uint16_t n_lines    線分の本数        (2 bytes)
  *   uint16_t n_points   点の個数          (2 bytes)
- *   uint8_t  flags      bit0=深度ソート済み bit1=透視投影済み (1 byte)
+ *   uint8_t  flags      bit0=深度ソート済み bit1=透視投影済み
+ *                       bit2=thick-fill(水平fill線のdepthを帯高さとして使う)
+ *                       bit3=三角セクションあり(z-buffer描画, ラベルの後) (1 byte)
  *   float    cx         スクリーン中心X (px) (4 bytes)
  *   float    cy         スクリーン中心Y (px) (4 bytes)
  *   合計: 2+2+1+4+4 = 13 bytes
@@ -56,7 +68,9 @@
  * 線分レコード (24 bytes each) × n_lines:
  *   float  x0, y0       スクリーン座標 始点   (4+4)
  *   float  x1, y1       スクリーン座標 終点   (4+4)
- *   float  depth        中点Z深度（ソート参照用） (4)
+ *   float  depth        中点Z深度（ソート参照用）。
+ *                       thick-fill時(hdr.flags bit2=0x04)は、水平線(y0==y1)に
+ *                       限りこのフィールドを「fill帯の高さ(px)」として読み替える。 (4)
  *   uint8_t r,g,b,a     RGBA 0-255            (1+1+1+1)
  *   合計: 4*5 + 1*4 = 24 bytes
  *
@@ -71,7 +85,19 @@
  *   uint16_t n_labels   ラベルの個数 (2 bytes)
  *   その後 n_labels 個のラベルレコード（可変長、gsp_3d_label_t参照）
  *
- * 全体のバイト数 = 13 + 24*n_lines + 20*n_points + 2 + (各ラベルの可変長合計)
+ * 三角セクション（新規 2026-07-23, flags bit3=0x08 のときのみラベルの直後）:
+ *   uint16_t n_tris     三角の個数 (2 bytes)
+ *   その後 n_tris 個の gsp_3d_tri_t (45 bytes each)
+ *   REVIEW NOTE 4 (2026-07-23, 案③ z-buffer 描画): line モード(スキャンライン
+ *   塗り)は面が単色 facet + z バッファ無しで凹の脳溝の遮蔽が壊れる。zbuffer
+ *   モードでは面を「投影三角形」として送り、クライアントが z バッファ付きソフト
+ *   ラスタライザで Gouraud 補間塗りする(遮蔽正確・襞滑らか・横縞なし)。三角は
+ *   線・点とは別セクションで、軸/ワイヤは従来通り線、電極は従来通り点のまま。
+ *   旧クライアントは bit3 を見ずこのセクションを読まない(面は出ないが破綻しない
+ *   =後方互換)。z は大きいほど手前(line の depth と同符号)。
+ *
+ * 全体のバイト数 = 13 + 24*n_lines + 20*n_points + 2 + (ラベル可変長合計)
+ *                  + (bit3 のとき: 2 + 45*n_tris)
  * -------------------------------------------------------- */
 typedef struct __attribute__((packed)) {
     uint16_t n_lines;
@@ -94,6 +120,19 @@ typedef struct __attribute__((packed)) {
     float   size;
     uint8_t r, g, b, a;
 } gsp_3d_point_t;         /* 20 bytes */
+
+/* 三角セクション(flags bit3=0x08)の頂点・三角レコード。案③ z-buffer 描画用。
+ * 頂点: スクリーン x,y + 深度 z(大きいほど手前) + Gouraud 色 r,g,b。
+ * クライアントは z バッファ付きソフトラスタライザで barycentric に z テスト+
+ * 色補間して塗る。line モードの gsp_3d_line_t とは別経路(共存する)。 */
+typedef struct __attribute__((packed)) {
+    float   x, y, z;
+    uint8_t r, g, b;
+} gsp_3d_vert_t;          /* 15 bytes */
+
+typedef struct __attribute__((packed)) {
+    gsp_3d_vert_t v[3];
+} gsp_3d_tri_t;           /* 45 bytes */
 
 /* --------------------------------------------------------
  * GSP_MSG_3D_INPUT ペイロード (14 bytes)

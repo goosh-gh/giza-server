@@ -384,6 +384,99 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
     }
 }
 
+/* --- Phase 2 (案③): z-buffer triangle rasteriser -----------------------
+ *
+ * Pure-C core (gsp_edge / gsp_raster_tris): Gouraud-shaded, z-tested triangle
+ * fill into an RGBA buffer + float z-buffer. No Cocoa/libm deps so it is unit-
+ * tested headless with gcc (see raster tests). _raster_and_blit wraps it: fills
+ * a transparent buffer, rasterises, makes a CGImage and blits it (vertically
+ * flipped: buffer row 0 = image top = view top, matching the view_h - y the
+ * line/point drawing uses). Larger z = nearer (same sign as gsp_3d_line depth).
+ * Used only when the frame carries a triangle section (flags bit3 = 0x08). */
+static inline float gsp_edge(float ax,float ay,float bx,float by,float cx,float cy){
+    return (bx-ax)*(cy-ay) - (by-ay)*(cx-ax);
+}
+static void gsp_raster_tris(uint8_t *px, float *zb, int w, int h,
+                            const gsp_3d_tri_t *tris, int n)
+{
+    for (int i = 0; i < n; i++) {
+        const gsp_3d_vert_t *V = tris[i].v;
+        float x0=V[0].x,y0=V[0].y,z0=V[0].z;
+        float x1=V[1].x,y1=V[1].y,z1=V[1].z;
+        float x2=V[2].x,y2=V[2].y,z2=V[2].z;
+        float area = gsp_edge(x0,y0,x1,y1,x2,y2);
+        if (area == 0.0f) continue;                      /* degenerate */
+        float inv = 1.0f/area;
+        float mnx=x0<x1?(x0<x2?x0:x2):(x1<x2?x1:x2);
+        float mxx=x0>x1?(x0>x2?x0:x2):(x1>x2?x1:x2);
+        float mny=y0<y1?(y0<y2?y0:y2):(y1<y2?y1:y2);
+        float mxy=y0>y1?(y0>y2?y0:y2):(y1>y2?y1:y2);
+        int minx=(int)mnx; if(minx<0)minx=0;
+        int maxx=(int)(mxx+1.0f); if(maxx>w-1)maxx=w-1;
+        int miny=(int)mny; if(miny<0)miny=0;
+        int maxy=(int)(mxy+1.0f); if(maxy>h-1)maxy=h-1;
+        for (int py=miny; py<=maxy; py++){
+            for (int pxx=minx; pxx<=maxx; pxx++){
+                float fx=pxx+0.5f, fy=py+0.5f;
+                float w0=gsp_edge(x1,y1,x2,y2,fx,fy);    /* weight for v0 */
+                float w1=gsp_edge(x2,y2,x0,y0,fx,fy);    /* weight for v1 */
+                float w2=gsp_edge(x0,y0,x1,y1,fx,fy);    /* weight for v2 */
+                int inside = (area>0) ? (w0>=0&&w1>=0&&w2>=0)
+                                      : (w0<=0&&w1<=0&&w2<=0);
+                if (!inside) continue;
+                float l0=w0*inv,l1=w1*inv,l2=w2*inv;
+                float z = l0*z0 + l1*z1 + l2*z2;
+                int idx = py*w + pxx;
+                if (z <= zb[idx]) continue;              /* z-test: larger = nearer */
+                zb[idx] = z;
+                float r=l0*V[0].r+l1*V[1].r+l2*V[2].r;
+                float g=l0*V[0].g+l1*V[1].g+l2*V[2].g;
+                float b=l0*V[0].b+l1*V[1].b+l2*V[2].b;
+                uint8_t *o = px + idx*4;
+                o[0]=(uint8_t)(r<0?0:(r>255?255:r));
+                o[1]=(uint8_t)(g<0?0:(g>255?255:g));
+                o[2]=(uint8_t)(b<0?0:(b>255?255:b));
+                o[3]=255;
+            }
+        }
+    }
+}
+static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
+                             int w, int h, float view_h)
+{
+    if (w <= 0 || h <= 0 || n <= 0) return;
+    /* the triangle section sits after variable-length labels, so tri_src may be
+     * unaligned; copy into an aligned array before touching float members. */
+    gsp_3d_tri_t *tris = (gsp_3d_tri_t*)malloc((size_t)n * sizeof(gsp_3d_tri_t));
+    if (!tris) return;
+    memcpy(tris, tri_src, (size_t)n * sizeof(gsp_3d_tri_t));
+
+    uint8_t *px = (uint8_t*)calloc((size_t)w*h*4, 1);    /* transparent (a=0) bg */
+    float   *zb = (float*)malloc((size_t)w*h*sizeof(float));
+    if (!px || !zb) { free(px); free(zb); free(tris); return; }
+    for (int i=0;i<w*h;i++) zb[i] = -1e30f;
+    gsp_raster_tris(px, zb, w, h, tris, n);
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, (size_t)w*h*4, NULL);
+    /* R,G,B,A memory order -> AlphaLast + 32Big. Flag combo to check first if
+     * colours look swapped on device. */
+    CGImageRef img = CGImageCreate(w, h, 8, 32, (size_t)w*4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big,
+        dp, NULL, false, kCGRenderingIntentDefault);
+    if (img) {
+        CGContextSaveGState(ctx);
+        CGContextTranslateCTM(ctx, 0, view_h);           /* flip: row0=top -> view top */
+        CGContextScaleCTM(ctx, 1, -1);
+        CGContextDrawImage(ctx, CGRectMake(0,0,w,h), img);
+        CGContextRestoreGState(ctx);
+        CGImageRelease(img);
+    }
+    CGDataProviderRelease(dp);                            /* release before free: px unreferenced */
+    CGColorSpaceRelease(cs);
+    free(px); free(zb); free(tris);
+}
+
 /* --- Phase 2: 3D mode draw routine -------------------------------------
  *
  * Layout of the raw payload (see gsp_3d.h, numbers 0x24-0x27 after the
@@ -446,18 +539,65 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
 
     CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
 
-    /* ---- lines (already back-to-front sorted by the server) ---- */
+    /* ---- triangle section (flags bit3 = 0x08): z-buffer cortex, drawn FIRST
+     * as the background layer so axes/electrodes/labels overlay it. It sits
+     * after lines+points+labels; walk a separate cursor (tp) to reach it so the
+     * existing line/point/label parsing below (using p) is untouched. */
+    if (hdr.flags & 0x08) {
+        const uint8_t *tp  = buf + need;                 /* start of label section */
+        const uint8_t *end = buf + buflen;
+        if (tp + 2 <= end) {
+            uint16_t n_labels; memcpy(&n_labels, tp, 2); tp += 2;
+            for (uint16_t i = 0; i < n_labels && tp + 14 <= end; i++) {
+                uint8_t len = tp[13];                    /* label fixed part 14B, len at offset 13 */
+                tp += 14 + (size_t)len;
+            }
+            if (tp + 2 <= end) {
+                uint16_t n_tris; memcpy(&n_tris, tp, 2); tp += 2;
+                if (n_tris > 0 &&
+                    tp + (size_t)n_tris * sizeof(gsp_3d_tri_t) <= end) {
+                    _raster_and_blit(ctx, tp, (int)n_tris,
+                                     (int)bounds.size.width,
+                                     (int)bounds.size.height, view_h);
+                }
+            }
+        }
+    }
+
+    /* ---- lines (already back-to-front sorted by the server) ----
+     *
+     * thick-fill (flags & 0x04, added 2026-07-23): the mesh scanline fill
+     * emits horizontal spans (y0==y1). When their vertical spacing (step)
+     * exceeds 1px at high zoom, 1px strokes leave inter-row gaps = visible
+     * horizontal striping. With this flag the span's ".depth" field carries
+     * the fill-bar height (= ceil(step)); we draw each horizontal span as a
+     * filled rectangle of that height so rows tile with no gaps. Non-
+     * horizontal lines (axes/wireframe) and the flag-off case still stroke
+     * at 1px. ".depth" is otherwise unused in drawing (records arrive pre-
+     * sorted), so repurposing it costs nothing on the wire. */
+    int thick_fill = (hdr.flags & 0x04) != 0;
     for (uint16_t i = 0; i < hdr.n_lines; i++) {
         gsp_3d_line_t ln;
         memcpy(&ln, p, sizeof(ln));
         p += sizeof(ln);
 
-        CGContextSetRGBStrokeColor(ctx,
-            ln.r / 255.0f, ln.g / 255.0f, ln.b / 255.0f, ln.a / 255.0f);
-        CGContextSetLineWidth(ctx, 1.0f);
-        CGContextMoveToPoint(ctx, ln.x0, view_h - ln.y0);
-        CGContextAddLineToPoint(ctx, ln.x1, view_h - ln.y1);
-        CGContextStrokePath(ctx);
+        float dy = ln.y1 - ln.y0; if (dy < 0.0f) dy = -dy;
+        if (thick_fill && dy < 0.5f) {              /* horizontal span -> bar */
+            float h = ln.depth; if (h < 1.0f) h = 1.0f; if (h > 64.0f) h = 64.0f;
+            float xL = (ln.x0 < ln.x1) ? ln.x0 : ln.x1;
+            float xR = (ln.x0 < ln.x1) ? ln.x1 : ln.x0;
+            float w  = xR - xL; if (w < 1.0f) w = 1.0f;
+            CGContextSetRGBFillColor(ctx,
+                ln.r / 255.0f, ln.g / 255.0f, ln.b / 255.0f, ln.a / 255.0f);
+            CGContextFillRect(ctx, CGRectMake(xL, view_h - ln.y0 - h, w, h));
+        } else {                                    /* 1px stroke as before */
+            CGContextSetRGBStrokeColor(ctx,
+                ln.r / 255.0f, ln.g / 255.0f, ln.b / 255.0f, ln.a / 255.0f);
+            CGContextSetLineWidth(ctx, 1.0f);
+            CGContextMoveToPoint(ctx, ln.x0, view_h - ln.y0);
+            CGContextAddLineToPoint(ctx, ln.x1, view_h - ln.y1);
+            CGContextStrokePath(ctx);
+        }
     }
 
     /* ---- points ---- */
@@ -1348,7 +1488,14 @@ static void _create_window_on_main(void *ptr)
     int iw = req->suggested_w > 0 ? req->suggested_w : 800;
     int ih = req->suggested_h > 0 ? req->suggested_h : 600;
 
-    NSRect frame = NSMakeRect(100 + idx * 24, 100 + idx * 24, iw, ih);
+    /* The GsView (the 3D drawing area) sits inside the content minus 28px
+     * slider strips on the bottom and right (see slider_h/slider_w below).
+     * Enlarge the content by those strips so the GsView ends up EXACTLY the
+     * requested iw x ih. The client computes its projection centre as
+     * width/2,height/2 (= iw/2), which must equal the GsView centre; otherwise
+     * (old behaviour: GsView = iw-28) zoom/scaling happens about a point offset
+     * from the view centre by 14px. */
+    NSRect frame = NSMakeRect(100 + idx * 24, 100 + idx * 24, iw + 28, ih + 28);
     NSUInteger style =
         NSWindowStyleMaskTitled          |
         NSWindowStyleMaskClosable        |
