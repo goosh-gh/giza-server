@@ -94,6 +94,23 @@ default `./configure` now auto-detects **Xlib**, so you get the interactive
 sliders, mouse zoom/pan, and tabs out of the box; the legacy GTK backend is
 still available via `--with-viewer=gtk` if you specifically need it.
 
+
+## 3D export and seed editing (Cocoa viewer)
+
+- **File → “Export 3D as OBJ/USDA…”** opens a save dialog and writes the
+  current 3D scene to the chosen path. The reverse-channel message
+  `GSP_MSG_3D_EXPORT` (0x28) carries a format byte (0 = OBJ, 1 = USDA) and the
+  chosen path; the Perl client (`Driver::GS3D`) writes the file directly from
+  the scene geometry (no byte round-trip). Geometry is produced by
+  `PDL::Graphics::Cairo::SceneExport` (cortex mesh, disc electrode markers,
+  Helvetica labels, seed markers).
+- **Left-click** places a seed mark on the cortex; **right-click** removes the
+  nearest seed mark. Right-click sends `GSP_MSG_PICK` with the right button set;
+  the client removes the nearest seed within a small screen radius.
+
+Both are available in the Cocoa viewer only.
+
+
 ## Architecture
 
 ```

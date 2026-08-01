@@ -84,8 +84,24 @@
 #include <errno.h>
 #include "giza-server-protocol.h"
 #include "gsp_3d.h"   /* Phase 2: 3D message types (0x24-0x27) */
+
+/* menu「Export OBJ/USDA」の逆チャネル型。canonical な定義は gsp_3d.h に
+ * 置く(GS3D.pm と一致)。gsp_3d.h 未更新でもこの .m 単体でビルドできるよう
+ * 保険で guarded define する。ペイロードは format 1 バイト。 */
+#ifndef GSP_MSG_3D_EXPORT
+#define GSP_MSG_3D_EXPORT 0x28
+#endif
+#define GSP_EXPORT_FMT_OBJ  0
+#define GSP_EXPORT_FMT_USDA 1
+
+/* export 保存先パス用バッファの上限(macOS は <sys/syslimits.h> で定義済みの
+ * はずだが、未定義環境向けに保険)。 */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 static void _slider_send(int win_id, uint8_t slider_id, float value);
 static void _savereq_send(int win_id, uint8_t fmt);
+static void _3d_export_send(int win_id, uint8_t fmt, const char *path);   /* Phase 2: 3D scene export (OBJ/USDA) */
 static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px);
 static void _cursor_send(int win_id, float fx, float fy, uint8_t buttons, uint8_t type);
 static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
@@ -865,6 +881,41 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
         _zoom_send(self->win_id, (float)_zoom, (float)_pan_x, (float)_pan_y);
 }
 
+/* 右クリック(3D): 最も近い seed マークを1つ消す。左クリック(pick=追加)の対称。
+ * 専用メッセージは作らず、GSP_MSG_PICK を btn=2(右)で送るだけ。Driver::GS3D 側が
+ * btn==2 を見て _unpick_at_screen(最近傍 seed 削除)に回す。super を呼ばないので
+ * コンテキストメニューは出さない(3D 窓では不要)。 */
+- (void)rightMouseDown:(NSEvent *)event
+{
+    if (_is_3d) {
+        _3d_down_point = [self convertPoint:[event locationInWindow] fromView:nil];
+        return;
+    }
+    [super rightMouseDown:event];
+}
+
+- (void)rightMouseUp:(NSEvent *)event
+{
+    if (_is_3d) {
+        NSPoint up = [self convertPoint:[event locationInWindow] fromView:nil];
+        double mdx = up.x - _3d_down_point.x;
+        double mdy = up.y - _3d_down_point.y;
+        if (mdx*mdx + mdy*mdy <= 9.0) {          /* < 3px travel = click */
+            NSRect b = [self bounds];
+            if (b.size.width > 0 && b.size.height > 0) {
+                float fx = (float)((up.x - b.origin.x) / b.size.width);
+                float fy = (float)(1.0 - (up.y - b.origin.y) / b.size.height);  /* Cocoa y up → image y down */
+                if (fx >= 0.0f && fx <= 1.0f && fy >= 0.0f && fy <= 1.0f) {
+                    uint8_t btn = (uint8_t)([event buttonNumber] + 1);   /* 右ボタン → 2 */
+                    _cursor_send(self->win_id, fx, fy, btn, GSP_MSG_PICK);
+                }
+            }
+        }
+        return;
+    }
+    [super rightMouseUp:event];
+}
+
 /* ---- cursor (mouse-move) tracking ----------------------------------- */
 
 - (void)mouseMoved:(NSEvent *)event
@@ -997,6 +1048,9 @@ static struct {
 - (void)_vectorSave:(NSString *)fmt;
 - (void)_vectorSaveExited:(NSString *)fmt view:(GsView *)view;
 - (void)_emitResize:(NSNumber *)boxedWinId;
+- (void)exportOBJ:(id)sender;
+- (void)exportUSDA:(id)sender;
+- (void)_export3D:(uint8_t)fmt;
 @end
 
 @implementation GsAppDelegate (FileSave)
@@ -1073,6 +1127,12 @@ static BOOL _gsview_is_live(GsView *v)
     if (a == @selector(savePDF:) || a == @selector(saveSVG:)) {
         GsView *v = [self _frontGsView];
         return (v != nil && GS.wins[v->win_id].client_fd >= 0);
+    }
+    if (a == @selector(exportOBJ:) || a == @selector(exportUSDA:)) {
+        /* 3D 窓のシーンを Perl 側が書き出す。3D 窓かつ client 生存が条件
+         * (2D 窓や client 終了後の窓では意味がないのでグレーアウト)。 */
+        GsView *v = [self _frontGsView];
+        return (v != nil && v->_is_3d && GS.wins[v->win_id].client_fd >= 0);
     }
     return YES;
 }
@@ -1219,6 +1279,43 @@ static BOOL _gsview_is_live(GsView *v)
 
 - (void)savePDF:(id)sender { (void)sender; [self _vectorSave:@"PDF"]; }
 - (void)saveSVG:(id)sender { (void)sender; [self _vectorSave:@"SVG"]; }
+
+/* File > Export 3D as OBJ/USDA.
+ * PDF/SVG と同じく NSSavePanel(シート)で保存先を選ばせ、選んだパスを
+ * export 要求に載せて Perl(Driver::GS3D)へ送る。ジオメトリは Perl 側が持つ
+ * ので Perl がそのパスへ直接書く(SAVEDATA のバイト往復は無い)。3D 窓かつ
+ * client 生存でのみ有効(validateMenuItem: と二重で確認)。 */
+- (void)_export3D:(uint8_t)fmt
+{
+    GsView *view = [self _frontGsView];
+    if (!view || !view->_is_3d) { NSBeep(); return; }   /* 3D 窓でない(通常グレーアウト) */
+    int win_id = view->win_id;
+    if (GS.wins[win_id].client_fd < 0) { NSBeep(); return; }   /* client 終了=書き手が居ない */
+
+    NSString *ext  = (fmt == GSP_EXPORT_FMT_USDA) ? @"usda" : @"obj";
+    NSString *base = (GS.wins[win_id].title[0])
+        ? [NSString stringWithUTF8String:GS.wins[win_id].title] : @"scene";
+    base = [base stringByReplacingOccurrencesOfString:@"/" withString:@"-"];
+
+    /* obj/usda に標準 UTType は無いので content-type フィルタは掛けず、
+     * 既定ファイル名の拡張子で示す(savePNG の macOS<11 分岐と同じ考え方)。 */
+    NSSavePanel *panel = [NSSavePanel savePanel];
+    [panel setNameFieldStringValue:[base stringByAppendingPathExtension:ext]];
+
+    NSWindow *key = [view window];
+    [panel beginSheetModalForWindow:key
+                  completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK) return;
+        NSString *path = [[panel URL] path];
+        if (!path) { NSBeep(); return; }
+        /* シートが開いている間に client が終了している可能性がある。
+         * _3d_export_send は write_lock 下で client_fd を再確認するので、
+         * その場合の送信は捨てられる(害なし)。 */
+        _3d_export_send(win_id, fmt, [path fileSystemRepresentation]);
+    }];
+}
+- (void)exportOBJ:(id)sender  { (void)sender; [self _export3D:GSP_EXPORT_FMT_OBJ];  }
+- (void)exportUSDA:(id)sender { (void)sender; [self _export3D:GSP_EXPORT_FMT_USDA]; }
 
 /* ---- NSWindowDelegate ---- */
 /* Window resized by the user. For a connected window (show_interactive)
@@ -1413,6 +1510,17 @@ static void _build_menu_bar(void)
     [file_menu addItemWithTitle:@"Save as SVG…"
                          action:@selector(saveSVG:)
                   keyEquivalent:@""];    /* no shortcut */
+
+    /* 3D シーンの書き出し(3D 窓のときだけ validateMenuItem: で有効化)。
+     * 表示中の cortex mesh + 電極 + ラベル + 頂点カラーを、投影前の MNI mm
+     * ジオメトリのまま Perl 側(Driver::GS3D)が .obj / .usda に書く。 */
+    [file_menu addItem:[NSMenuItem separatorItem]];
+    [file_menu addItemWithTitle:@"Export 3D as OBJ…"
+                         action:@selector(exportOBJ:)
+                  keyEquivalent:@""];
+    [file_menu addItemWithTitle:@"Export 3D as USDA…"
+                         action:@selector(exportUSDA:)
+                  keyEquivalent:@""];
 }
 
 /* ------------------------------------------------------------------ */
@@ -1828,6 +1936,30 @@ static void _savereq_send(int win_id, uint8_t fmt)
     pthread_mutex_lock(&w->write_lock);
     if (w->client_fd >= 0)
         _send_msg(w->client_fd, GSP_MSG_SAVEREQ, w->seq_out++, &fmt, 1);
+    pthread_mutex_unlock(&w->write_lock);
+}
+
+/* menu「Export OBJ/USDA」→ 3D クライアント(Driver::GS3D)へ書き出し要求を
+ * 送る。SAVEREQ と同型の逆チャネル送信だが、ペイロードは format 1 バイト +
+ * NSSavePanel で選んだ保存先パス(任意, UTF-8, 終端 NUL 無し=長さは len で確定)。
+ * ジオメトリは Perl 側が持つので、SAVEDATA のようなバイト往復は無い(Perl が
+ * そのパスへ直接ファイルを書く)。path==NULL/空なら Perl 側が既定名を作る。 */
+static void _3d_export_send(int win_id, uint8_t fmt, const char *path)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive) return;
+
+    /* 1 バイトの format に続けてパス文字列を連結(NUL 終端は送らない)。 */
+    char   buf[1 + PATH_MAX];
+    size_t plen = path ? strnlen(path, PATH_MAX) : 0;
+    buf[0] = (char)fmt;
+    if (plen) memcpy(buf + 1, path, plen);
+
+    pthread_mutex_lock(&w->write_lock);
+    if (w->client_fd >= 0)
+        _send_msg(w->client_fd, GSP_MSG_3D_EXPORT, w->seq_out++,
+                  buf, (uint32_t)(1 + plen));
     pthread_mutex_unlock(&w->write_lock);
 }
 
