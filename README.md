@@ -86,8 +86,10 @@ slider's normalized [0,1] position to the client),
 while zoomed, middle-click to reset), per-PID tab
 grouping (figures from the same client process share one window with a
 cairo-drawn tab bar — click to switch, per-tab `×` to close, WM-close discards
-the whole group), and the close-signals-the-client lifecycle; vector
-`File ▸ Save` and `RESIZE` resize replot are not yet wired on Xlib. The
+the whole group), 3D frame rendering (lines, points, labels, thick-fill
+spans, and the z-buffer Gouraud triangle rasteriser — at parity with Cocoa),
+and the close-signals-the-client lifecycle; vector `File ▸ Save` and
+`RESIZE` resize replot are not yet wired on Xlib. The
 **GTK** viewer is the original display-only backend (PNG frames, titles,
 persistence) — no sliders, save, mouse interaction, or tabs. On Linux, the
 default `./configure` now auto-detects **Xlib**, so you get the interactive
@@ -215,9 +217,13 @@ carries lines, points, labels, and triangles in screen coordinates:
 - **Points** are drawn as markers and **labels** as text; mouse picks and
   cursor position over the 3D view are reported back to the client.
 
-This path is driven by `PDL::Graphics::Cairo`'s `Driver::GS3D`. It is
-implemented in the **Cocoa** (macOS) viewer only; the Xlib and GTK viewers do
-not render 3D frames.
+This path is driven by `PDL::Graphics::Cairo`'s `Driver::GS3D`. Both the
+**Cocoa** (macOS) and **Xlib** (Linux) viewers render the full frame — lines,
+points, labels, thick-fill spans, and the z-buffer Gouraud triangle
+rasteriser. The rasteriser core (`gsp_edge`/`gsp_raster_tris`) is shared
+byte-for-byte between the two backends; they differ only in how the raster is
+presented (Cocoa blits a `CGImage`, Xlib paints a cairo image surface). The
+**GTK** viewer does not render 3D frames.
 
 ### Mouse interaction (user controls)
 
