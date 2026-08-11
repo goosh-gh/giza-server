@@ -194,6 +194,12 @@ typedef struct {
     int        drag_x, drag_y;    /* screen coords at button-press start   */
     double     pan_x0, pan_y0;   /* pan at drag start                      */
     int        dragging;          /* 1 while Button1 held outside sliders   */
+    /* Coalesced 3D repaint. CMD_3D_FRAME only sets this; the main loop
+     * repaints the container once per drain cycle, after every queued
+     * frame has been read. Without it the 60fps 3D stream forced one
+     * full-window repaint per frame (the direct-draw sweep/flicker and
+     * main-thread saturation). */
+    int        repaint_pending;
 } GsContainer;
 
 /* ------------------------------------------------------------------ */
@@ -614,14 +620,18 @@ _repaint_container(GsContainer *c)
     int tabs[MAX_WINDOWS];
     int n = _container_tabs(ci, tabs, MAX_WINDOWS);
 
-    cairo_surface_t *xsurf = cairo_xlib_surface_create(
-        GS.dpy, c->xwin, DefaultVisual(GS.dpy, GS.screen),
-        c->width, c->height);
-    if (cairo_surface_status(xsurf) != CAIRO_STATUS_SUCCESS) {
-        cairo_surface_destroy(xsurf);
+    /* Double-buffer: compose the whole frame into a client-side image
+     * surface, then blit it to the window in one paint (see tail). Drawing
+     * the 3D line stream (tens of thousands of strokes) straight onto the
+     * xlib surface presented the window partially updated -- a bottom-to-top
+     * "sweep" -- and flooded the X connection one request per primitive. */
+    cairo_surface_t *img = cairo_image_surface_create(
+        CAIRO_FORMAT_RGB24, c->width, c->height);
+    if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(img);
         return;
     }
-    cairo_t *cr = cairo_create(xsurf);
+    cairo_t *cr = cairo_create(img);
 
     /* clear */
     cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
@@ -681,7 +691,21 @@ _repaint_container(GsContainer *c)
         _draw_tabbar(cr, c, tabs, n);
 
     cairo_destroy(cr);
+
+    /* Present: blit the finished off-screen frame to the window in a single
+     * paint, so the on-screen update is one image transfer with no sweep. */
+    cairo_surface_t *xsurf = cairo_xlib_surface_create(
+        GS.dpy, c->xwin, DefaultVisual(GS.dpy, GS.screen),
+        c->width, c->height);
+    if (cairo_surface_status(xsurf) == CAIRO_STATUS_SUCCESS) {
+        cairo_t *xcr = cairo_create(xsurf);
+        cairo_set_source_surface(xcr, img, 0, 0);
+        cairo_paint(xcr);
+        cairo_destroy(xcr);
+        cairo_surface_flush(xsurf);
+    }
     cairo_surface_destroy(xsurf);
+    cairo_surface_destroy(img);
     XFlush(GS.dpy);
 }
 
@@ -797,8 +821,11 @@ _dispatch(Cmd *cmd)
             w3->p3d_len = cmd->p3d_len;
             w3->is_3d   = 1;             /* 初回フレームでラッチ */
             cmd->p3d    = NULL;
+            /* Coalesce: flag the container instead of repainting now. The
+             * main loop repaints once after the drain, collapsing a burst of
+             * queued frames into a single window update. */
             if (w3->container >= 0 && GS.conts[w3->container].alive)
-                _repaint_container(&GS.conts[w3->container]);
+                GS.conts[w3->container].repaint_pending = 1;
         } else {
             free(cmd->p3d);
         }
@@ -1626,6 +1653,16 @@ int main(void)
             Cmd *cmd;
             while (read(g_wake_rd, &cmd, sizeof(Cmd *)) == (ssize_t)sizeof(Cmd *))
                 _dispatch(cmd);
+        }
+
+        /* Coalesced repaint pass. CMD_3D_FRAME only flagged its container,
+         * so a burst of 3D frames drained above now costs one repaint per
+         * container rather than one per frame. */
+        for (int i = 0; i < MAX_CONTAINERS; i++) {
+            if (GS.conts[i].alive && GS.conts[i].repaint_pending) {
+                GS.conts[i].repaint_pending = 0;
+                _repaint_container(&GS.conts[i]);
+            }
         }
     }
 
