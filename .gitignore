@@ -61,3 +61,4 @@ viewer/giza-server-osx-3d.m
 tools/wx/
 download/
 .DS_Store
+tools/bench_xlib_repaint
