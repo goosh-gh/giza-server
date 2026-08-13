@@ -442,7 +442,13 @@ static void gsp_raster_tris(uint8_t *px, float *zb, int w, int h,
                 if (!inside) continue;
                 float l0=w0*inv,l1=w1*inv,l2=w2*inv;
                 float z = l0*z0 + l1*z1 + l2*z2;
-                int idx = py*w + pxx;
+                /* 縦ミラー: line 経路は各頂点を view_h - y で描く。三角ラスタは
+                 * projected y をそのままバッファ行に使い _raster_and_blit の CTM
+                 * フリップで出すため、この2つが逆になり zbuffer だけ上下反転して
+                 * いた(line=正の基準に対し実機で確認)。書込み行を (h-1-py) に反転
+                 * して line と同じ向きに揃える。zb/px 双方が idx を共有するので
+                 * z テストは不変(行の全単射)。 */
+                int idx = (h - 1 - py)*w + pxx;
                 if (z <= zb[idx]) continue;              /* z-test: larger = nearer */
                 zb[idx] = z;
                 float r=l0*V[0].r+l1*V[1].r+l2*V[2].r;
