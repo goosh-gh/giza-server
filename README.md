@@ -231,7 +231,7 @@ presented (Cocoa blits a `CGImage`, Xlib paints a cairo image surface). The
 |--------|---------------|--------------|
 | Zoom | pinch, or **Ctrl + scroll** | **scroll wheel** |
 | Pan (only while zoomed) | drag the plot, or two-finger scroll | drag the plot |
-| Reset zoom/pan | **double-click** | **middle-click** |
+| Reset zoom/pan (when zoomed) | **double-click** | **middle-click** |
 | Pick (report click) | single click in plot | single click in plot |
 | Cursor readout | move the mouse over the plot | move the mouse over the plot |
 
@@ -239,6 +239,16 @@ On macOS a live coordinate label is shown in the top-right of the plot area
 while the cursor is inside it. The coordinates reported to the client are
 image fractions; converting them to data coordinates is the client's job (it
 knows the axis limits and margins).
+
+The Cocoa viewer also reports two 2D gestures to the client so it can drive its
+own interactions. A **double-click** is sent as a `PICK` with the double-click
+bit set in the button byte, and the native zoom reset is applied only when the
+plot is actually zoomed — so a double-click on an unzoomed plot is purely the
+client gesture (for example, opening a zoomed child window for the subplot
+under the cursor). A **button-held drag** streams `CURSOR` events with the
+button byte non-zero, so the client receives a position stream during a
+press-drag, not only on hover. These two 2D reports are Cocoa-only; the Xlib
+viewer does not emit them yet.
 
 ## Build
 
@@ -289,15 +299,18 @@ sudo make install
 
 # Build
 autoreconf -fi
-./configure            # auto-detects Cocoa on macOS
+# Force Xcode's clang for the Objective-C / Cocoa build. On a MacPorts system a
+# MacPorts gcc picked up by AC_PROG_OBJC cannot find Cocoa.framework and configure
+# aborts with "Cocoa framework not found; macOS SDK required".
+./configure CC=clang OBJC=clang
 make
 sudo make install
 ```
 
-**MacPorts note.** On a MacPorts system the default `gcc` may be picked up
-by `AC_PROG_OBJC` and lacks Objective-C/Cocoa support, and `pkg-config`
-lives under `/opt/local`. Use the Xcode `clang` and the MacPorts
-`pkg-config` explicitly:
+**MacPorts note.** The `CC=clang OBJC=clang` above covers the common failure
+(a MacPorts `gcc` picked up by `AC_PROG_OBJC` can't find Cocoa.framework). If
+`configure` also can't find cairo — its `pkg-config` lives under `/opt/local`
+— pass that too, and run `make check`:
 
 ```bash
 autoreconf -if

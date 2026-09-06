@@ -799,9 +799,24 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
         return;
     }
     if (event.clickCount == 2) {
-        _zoom  = 1.0; _pan_x = 0.0; _pan_y = 0.0;
-        _zoom_send(self->win_id, 1.0f, 0.0f, 0.0f);
-        [self setNeedsDisplay:YES];
+        /* Notify the client of a double-click, as a PICK carrying the image
+         * fraction with bit 0x10 OR-ed into the button byte. Clients that
+         * don't care ignore the flag; show_grid_scrub uses it to open a
+         * zoomed window for the subplot under the cursor. */
+        NSPoint dcp = [self convertPoint:[event locationInWindow] fromView:nil];
+        double dfx, dfy;
+        if ([self _viewPoint:dcp toImageFx:&dfx fy:&dfy]) {
+            uint8_t dbtn = (uint8_t)(([event buttonNumber] + 1) | 0x10);
+            _cursor_send(self->win_id, (float)dfx, (float)dfy, dbtn, GSP_MSG_PICK);
+        }
+        /* Only reset native pan/zoom when actually zoomed, so a double-click
+         * on an unzoomed plot is purely a client gesture (no spurious reset
+         * flashing the window). */
+        if (_zoom > 1.0) {
+            _zoom  = 1.0; _pan_x = 0.0; _pan_y = 0.0;
+            _zoom_send(self->win_id, 1.0f, 0.0f, 0.0f);
+            [self setNeedsDisplay:YES];
+        }
         return;
     }
     /* Begin drag-pan */
@@ -841,6 +856,18 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
         _rot_drag_start = cur;
         return;
     }
+    /* 2D drag: emit a CURSOR event with the button-held flag (btn=1) so
+     * clients doing live scrubbing get a stream during a press-drag, not
+     * only on hover. Done before the pan short-circuit so it fires even
+     * when the plot is not zoomed (the 5x5 scrub case). Plain hover keeps
+     * sending btn=0 from mouseMoved:. */
+    {
+        NSPoint dgp = [self convertPoint:[event locationInWindow] fromView:nil];
+        double dgx, dgy;
+        if ([self _viewPoint:dgp toImageFx:&dgx fy:&dgy])
+            _cursor_send(self->win_id, (float)dgx, (float)dgy, 1, GSP_MSG_CURSOR);
+    }
+
     if (_zoom <= 1.0) return;   /* no pan when not zoomed */
     NSPoint cur = [self convertPoint:[event locationInWindow] fromView:nil];
     NSRect  dst = [self _plotDstRect];

@@ -8,6 +8,15 @@ grouped below under the backend/feature themes they belong to.
 
 ## Unreleased
 
+### Added — 2D double-click and press-drag reporting (Cocoa)
+
+The Cocoa viewer reports two more 2D gestures to the client. A double-click is
+sent as `PICK` with the double-click bit set in the button byte, and the native
+zoom reset now fires only when the plot is zoomed (a double-click on an unzoomed
+plot is purely the client gesture). A button-held drag streams `CURSOR` events
+with the button byte non-zero. Together these let a client open a zoomed child
+window for the subplot under the cursor and scrub along it. Xlib is unchanged.
+
 ### Changed — Linux default backend is now Xlib (was GTK 3)
 
 `./configure` with no `--with-viewer` argument now selects the **Xlib**
