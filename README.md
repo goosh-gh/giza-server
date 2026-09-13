@@ -467,7 +467,8 @@ examples/
   client_slider.c          — bidirectional slider demo (GSP + Cairo)
   client_mouse.c           — mouse cursor/pick/zoom demo (GSP + Cairo)
 patches/
-  giza-v1.5.0-drivers.patch — patch for giza upstream
+  giza-v1.5.0-drivers.patch — patch for giza upstream (1.5.0)
+  giza-v2.0.0-drivers.patch — patch for giza upstream (2.0.0)
 ```
 
 ## License

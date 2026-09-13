@@ -1,0 +1,122 @@
+--- a/src/giza-drivers-private.h
++++ b/src/giza-drivers-private.h
+@@ -36,6 +36,7 @@
+ #define GIZA_DEVICE_AQT    11
+ #define GIZA_DEVICE_OSXCOCOA    20
+ #define GIZA_DEVICE_CAIRO       21
++#define GIZA_DEVICE_GS     30
+ 
+ #define GIZA_DEFAULT_PREFIX "giza"
+ 
+--- a/src/giza-drivers.c
++++ b/src/giza-drivers.c
+@@ -25,6 +25,7 @@
+ #include "giza-private.h"
+ #include "giza-drivers-private.h"
+ #include "giza-driver-xw-private.h"
++#include "giza-driver-gs-private.h"
+ #include "giza-driver-png-private.h"
+ #include "giza-driver-mp4-private.h"
+ #include "giza-driver-pdf-private.h"
+@@ -249,6 +250,12 @@
+       break;
+ #endif
+ 
++#ifdef _GIZA_HAS_GS
++    case GIZA_DEVICE_GS:
++      success = _giza_open_device_gs (width, height, units);
++      break;
++#endif
++
+     case GIZA_DEVICE_MP4:
+     case GIZA_DEVICE_PNG:
+       success = _giza_open_device_png (width, height, units);
+@@ -465,6 +472,11 @@
+         _giza_flush_device_osxcocoa ();
+         return;
+ #endif
++#ifdef _GIZA_HAS_GS
++      case GIZA_DEVICE_GS:
++        _giza_flush_device_gs ();
++        break;
++#endif
+        default:
+          if (!Dev[id].surface)
+            {
+@@ -541,6 +553,11 @@
+       _giza_change_page_osxcocoa ();
+       break;
+ #endif
++#ifdef _GIZA_HAS_GS
++    case GIZA_DEVICE_GS:
++      _giza_change_page_gs ();
++      break;
++#endif
+     case GIZA_DEVICE_MP4:
+     case GIZA_DEVICE_PNG:
+       _giza_change_page_png ();
+@@ -684,6 +701,11 @@
+       _giza_close_device_osxcocoa ();
+       break;
+ #endif
++#ifdef _GIZA_HAS_GS
++    case GIZA_DEVICE_GS:
++      _giza_close_device_gs ();
++      break;
++#endif
+     case GIZA_DEVICE_MP4:
+       _giza_close_device_mp4(1);
+       break;
+@@ -1025,8 +1047,7 @@
+     newDevice = GIZA_DEVICE_NULL;
+ #ifdef _GIZA_HAS_XW
+   else if (!strcmp (devName, "/xw")
+-        || !strcmp (devName, "/xs")
+-        || !strcmp (devName, "/xserve")
++        /* /xs and /xserve are now handled by GIZA_DEVICE_GS below */
+         || !strcmp (devName, "/xwindow")
+         || !strcmp (devName, "/xwin"))
+     newDevice = GIZA_DEVICE_XW;
+@@ -1040,6 +1061,10 @@
+         || !strcmp (devName, "/macos"))
+     newDevice = GIZA_DEVICE_OSXCOCOA;
+ #endif
++  else if (!strcmp (devName, "/gs")
++        || !strcmp (devName, "/xs")
++        || !strcmp (devName, "/xserve"))
++    newDevice = GIZA_DEVICE_GS;
+   else if (!strcmp (devName, "/png"))
+     newDevice = GIZA_DEVICE_PNG;
+   else if (!strcmp(devName, "/mp4"))
+@@ -1232,6 +1257,11 @@
+       _giza_init_norm_osxcocoa ();
+       break;
+ #endif
++#ifdef _GIZA_HAS_GS
++    case GIZA_DEVICE_GS:
++      _giza_init_norm_gs ();
++      break;
++#endif
+     default:
+     /*
+      * The cairo transformations are:
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -28,7 +28,7 @@
+        giza-cursor-routines.c giza-device-has-cursor.c \
+        giza-draw-background.c giza-draw.c giza-driver-eps.c \
+        giza-driver-null.c giza-driver-cairo.c giza-driver-pdf.c giza-driver-png.c \
+-       giza-driver-mp4.c giza-driver-ps.c giza-driver-svg.c giza-driver-xw.c \
++       giza-driver-mp4.c giza-driver-ps.c giza-driver-svg.c giza-driver-xw.c giza-driver-gs.c \
+        giza-drivers.c giza-environment.c giza-error-bars.c giza-fill.c \
+        giza-format-number.c giza-function-t.c giza-function-x.c \
+        giza-function-y.c giza-get-key-press.c giza-get-surface-size.c \
+@@ -41,7 +41,7 @@
+        giza-transforms.c giza-vector.c giza-streamplot.c giza-viewport.c giza-version.c \
+        giza-warnings.c giza-window.c giza.c lex.yy.c giza-itf.c \
+        giza-arrow-style-private.h giza-driver-svg-private.h giza-stroke-private.h \
+-       giza-band-private.h giza-driver-xw-private.h giza-subpanel-private.h \
++       giza-band-private.h giza-driver-xw-private.h giza-driver-gs-private.h giza-server-protocol.h giza-subpanel-private.h \
+        giza-character-size-private.h giza-drivers-private.h giza-text-background-private.h \
+        giza-colour-private.h giza-fill-private.h giza-text-private.h \
+        giza-cursor-private.h giza-io-private.h giza-axis-private.h giza-tick-private.h giza-transforms-private.h \

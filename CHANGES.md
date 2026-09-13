@@ -17,6 +17,36 @@ plot is purely the client gesture). A button-held drag streams `CURSOR` events
 with the button byte non-zero. Together these let a client open a zoomed child
 window for the subplot under the cursor and scrub along it. Xlib is unchanged.
 
+### Added — `/gs` registration patch for giza 2.0.0
+
+`patches/giza-v2.0.0-drivers.patch` registers the `/gs` device against
+**giza 2.0.0**. `GIZA_DEVICE_GS 30` now sits below the new
+`AQT`/`OSXCOCOA`/`CAIRO` entries, the five dispatch sites are placed after
+the `#ifdef _GIZA_HAS_OSXCOCOA` blocks as independent
+`#ifdef _GIZA_HAS_GS` sections, and the `Makefile.am` SOURCES hunks account
+for `giza-driver-cairo.c` and `giza-streamplot.c`. `/xs` and `/xserve`
+continue to resolve to `GIZA_DEVICE_GS`.
+
+`patches/giza-v1.5.0-drivers.patch` is kept alongside it for giza 1.5.0.
+
+Verified on Ubuntu 24.04 (aarch64): the patch applies to a pristine
+giza-2.0.0 tree with both `git apply` and `patch -p1`, giza builds, its own
+test suite passes (19 C tests, 10 Fortran tests), and the PGPLOT `/GS` path
+works. Not yet tested on macOS.
+
+### Fixed — Xlib viewer destroyed the window when the client sent `GSP_MSG_CLOSE`
+
+`_giza_close_device_gs()` sends `GSP_MSG_CLOSE` to mean *the window stays,
+the connection closes* — this is what makes `/gs` a persistent-window
+device. The GTK and Cocoa viewers ACK and disconnect, leaving the window up.
+The Xlib viewer instead dispatched `CMD_CLOSE`, tearing down the tab as soon
+as the client program exited. It now ACKs and falls through to the existing
+disconnect path, which clears `client_fd` and closes the socket without
+touching the window.
+
+This only showed up through the PGPLOT `/GS` route; `PDL::Graphics::Cairo`'s
+`Driver::GS` disconnects without sending `CLOSE` and was unaffected.
+
 ### Changed — Linux default backend is now Xlib (was GTK 3)
 
 `./configure` with no `--with-viewer` argument now selects the **Xlib**

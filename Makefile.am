@@ -100,6 +100,7 @@ EXTRA_DIST = \
     src/giza-driver-gs.c \
     src/giza-driver-gs-private.h \
     patches/giza-v1.5.0-drivers.patch \
+    patches/giza-v2.0.0-drivers.patch \
     giza-gs-driver.patch.annotation \
     test/test_ping.sh \
     test/test_png.sh \
