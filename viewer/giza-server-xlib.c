@@ -1471,11 +1471,16 @@ _connection_thread(void *arg)
         }
 
         case GSP_MSG_CLOSE: {
-            Cmd *cmd = calloc(1, sizeof(Cmd));
-            if (!cmd) { free(payload); goto done; }
-            cmd->type   = CMD_CLOSE;
-            cmd->win_id = wid;
-            _send_cmd(cmd);
+            /* "The window stays, the connection closes."  This is the
+             * contract documented in _giza_close_device_gs() and is what
+             * makes /gs a persistent-window device: the client program
+             * exits, the plot remains on screen.  Do NOT destroy the tab
+             * here -- the done: path below clears client_fd and closes the
+             * socket, which is all that is wanted.  The window is torn down
+             * only when the user closes it (_close_tab with
+             * user_initiated=1).  The GTK and Cocoa viewers have always
+             * behaved this way; this backend used to send CMD_CLOSE here,
+             * which destroyed the window as soon as the client exited. */
             _send_hdr(fd, GSP_MSG_ACK, 0, seq_out++);
             free(payload);
             goto done;
