@@ -150,6 +150,27 @@ _gs_sock_path(char *path, size_t n)
              (int)getuid());
 }
 
+/* Path for the stderr log of a server we launch ourselves. $TMPDIR is
+ * preferred because it is per-user on macOS; otherwise the socket
+ * directory is used, which is where the socket already lives. The uid
+ * keeps the name unique in a shared directory, as the socket name does.
+ *
+ * Call this in the parent: between fork() and exec() only async-signal-safe
+ * functions may be used, which rules out getenv() and snprintf(). */
+static void
+_gs_log_path(char *path, size_t n)
+{
+    const char *dir = getenv("TMPDIR");
+    size_t len;
+
+    if (!dir || dir[0] == '\0') dir = GIZA_SERVER_SOCK_DIR;
+
+    len = strlen(dir);
+    snprintf(path, n, "%s%sgiza_server_%d.log",
+             dir, (len > 0 && dir[len - 1] == '/') ? "" : "/",
+             (int)getuid());
+}
+
 static int
 _gs_try_connect(void)
 {
@@ -184,12 +205,34 @@ _gs_connect_or_launch(void)
     if (!server_bin || server_bin[0] == '\0')
         server_bin = "giza_server";
 
+    char logpath[256];
+    _gs_log_path(logpath, sizeof(logpath));
+
     pid_t pid = fork();
     if (pid == 0) {
+        static const char failmsg[] =
+            "giza-driver-gs: could not exec giza_server\n";
+
         setsid();
         int dn = open("/dev/null", O_RDWR);
-        if (dn >= 0) { dup2(dn, STDIN_FILENO); dup2(dn, STDOUT_FILENO); close(dn); }
+        if (dn >= 0) { dup2(dn, STDIN_FILENO); dup2(dn, STDOUT_FILENO); }
+
+        /* stderr must not stay attached to the caller's. A server holding
+         * the write end of the client's pipe keeps the reader from ever
+         * seeing EOF, so `client | grep ...` hangs after the client exits.
+         * Send it to a log so the startup banner is still recorded, and
+         * fall back to /dev/null when the log cannot be opened. The log is
+         * truncated so it only ever holds the current server's output. */
+        int lg = open(logpath, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+        if (lg >= 0) { dup2(lg, STDERR_FILENO); close(lg); }
+        else if (dn >= 0) dup2(dn, STDERR_FILENO);
+
+        if (dn >= 0) close(dn);
+
         execlp(server_bin, "giza_server", (char *)NULL);
+
+        ssize_t w = write(STDERR_FILENO, failmsg, sizeof(failmsg) - 1);
+        (void)w;
         _exit(127);
     }
 

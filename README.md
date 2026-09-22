@@ -29,6 +29,13 @@ listening — exactly the handshake described in giza issue #85. Because the
 server outlives the client, plot windows persist after the calling program
 exits, just like `pgxwin_server`.
 
+A server started this way writes its stderr to
+`$TMPDIR/giza_server_<uid>.log`, or `/tmp/giza_server_<uid>.log` when
+`TMPDIR` is unset. The file is truncated at each launch, so it holds the
+current server's output. Its stdin and stdout go to `/dev/null`, and none of
+the three stays attached to the client, so a client run as `client | reader`
+ends the pipeline when the client exits.
+
 ### Verified end-to-end
 
 The server has been driven end-to-end on macOS (Apple Silicon, macOS 15)
