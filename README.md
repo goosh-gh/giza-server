@@ -50,6 +50,24 @@ viewer, and the cursor position, clicks, and zoom/pan state are reported
 back to the client over the `CURSOR`, `PICK`, and `ZOOM` channels — see
 **Mouse interaction** below.
 
+The `/gs` device is verified against **giza 2.0.0** on both platforms.
+
+On **macOS** (Apple Silicon, macOS 26.6.2, Cocoa viewer):
+`patches/giza-v2.0.0-drivers.patch` applies cleanly to a pristine 2.0.0 tree,
+giza builds with both the Cocoa driver and `/gs` enabled, and its own suite
+passes unmodified — 19 C tests, 10 Fortran tests. A client that opens `/gs`
+through the PGPLOT C API gets a native window, and the window stays up after
+the client exits. With `GIZA_SERVER` unset the driver finds the binary through
+`$PATH`, so an installed `giza_server` is picked up without any environment
+setup.
+
+On **Ubuntu 24.04 aarch64** (Xlib viewer, 2026-09-13): the same patch applies
+to a pristine 2.0.0 tree with both `git apply` and `patch -p1`, giza builds,
+and the `/gs` window likewise stays up after the client exits. The 19 C tests
+pass as they are; the Fortran tests need the upstream fix from PR #124
+(`../../src/libgiza.la` added to `LDADD` in `test/F90/Makefile.am`) in order to
+link, and pass once it is applied.
+
 ## Backends
 
 The viewer is a **standalone binary** (`giza_server`) separate from the `/gs`
@@ -328,6 +346,39 @@ Force a specific backend:
 ./configure --with-viewer=gtk      # GTK 3 (Linux, legacy display-only)
 ./configure --with-viewer=cocoa    # macOS Cocoa
 ```
+
+### Registering the `/gs` device in giza
+
+The patches under `patches/` add `/gs` to giza's device table, but they only
+touch files that already exist upstream. The driver itself ships here, so copy
+it into the giza tree first:
+
+```bash
+GS=$(pwd)                     # this repository
+GIZA=/path/to/giza-2.0.0      # the giza source tree
+
+cp "$GS"/src/giza-driver-gs.c "$GS"/src/giza-driver-gs-private.h "$GIZA"/src/
+cp "$GS"/viewer/giza-server-protocol.h                           "$GIZA"/src/
+
+cd "$GIZA"
+git apply --check "$GS"/patches/giza-v2.0.0-drivers.patch
+git apply         "$GS"/patches/giza-v2.0.0-drivers.patch
+autoreconf -fi    # the patch edits src/Makefile.am
+```
+
+`_GIZA_HAS_GS` is defined in `giza-driver-gs-private.h` rather than by a
+configure switch, so the device does not show up in giza's configure summary.
+Read it off the built library instead:
+
+```bash
+nm -gU src/.libs/libgiza.2.dylib | grep _gs                 # macOS
+nm -D --defined-only src/.libs/libgiza.so.2 | grep _gs      # Linux
+```
+
+Five entries mean the device is compiled in: `_giza_open_device_gs`,
+`_giza_close_device_gs`, `_giza_change_page_gs`, `_giza_flush_device_gs` and
+`_giza_init_norm_gs`. Mach-O prepends an underscore to every C symbol, so on
+macOS they read `__giza_open_device_gs` and so on.
 
 ## Test
 

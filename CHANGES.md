@@ -32,7 +32,7 @@ continue to resolve to `GIZA_DEVICE_GS`.
 Verified on Ubuntu 24.04 (aarch64): the patch applies to a pristine
 giza-2.0.0 tree with both `git apply` and `patch -p1`, giza builds, its own
 test suite passes (19 C tests, 10 Fortran tests), and the PGPLOT `/GS` path
-works. Not yet tested on macOS.
+works. Verified on macOS (Apple Silicon, Cocoa viewer) on 2026-09-22.
 
 ### Fixed — Xlib viewer destroyed the window when the client sent `GSP_MSG_CLOSE`
 
