@@ -20,6 +20,11 @@ independently of the giza-server display server itself.
   canonical invariants (Fp top / T3 left / T4 right / Cz nearest) against real
   positions.
 - **foreground_giza_server.sh** — Helper to launch giza-server in the foreground.
+- **test_gs.c** — Minimal `/gs` client (PGPLOT C API) for checking the driver's
+  auto-launch path from the outside: that the window outlives the client, and
+  that running the client through a pipe returns as soon as it exits rather
+  than hanging on a descriptor the server inherited. Build and usage are in the
+  file's header comment.
 
 ## Building the Wx dependency (important)
 

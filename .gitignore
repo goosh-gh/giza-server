@@ -62,3 +62,4 @@ tools/wx/
 download/
 .DS_Store
 tools/bench_xlib_repaint
+tools/test_gs
