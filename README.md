@@ -38,7 +38,7 @@ ends the pipeline when the client exits.
 
 ### Verified end-to-end
 
-The server has been driven end-to-end on macOS (Apple Silicon, macOS 15)
+The server has been driven end-to-end on macOS (Apple Silicon)
 from `PDL::Graphics::Cairo`, which renders a figure to an in-memory PNG
 (`cairo_surface_write_to_png_stream`) and sends it over GSP with **no
 temporary files** on either side. Both the bundled `test/test_png` client
