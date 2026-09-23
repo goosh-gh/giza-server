@@ -15,10 +15,11 @@ independently of the giza-server display server itself.
 - **verify_wx_projection.pl** — Headless check of pdl_3d_wx.pl's projection
   convention (screen-Y flip) and trackball rotation (identity seed, rigidity,
   pole-free continuity). Depends only on `Test::More` (no PDL/Wx required).
-- **standard_1020.elc** — International 10-20 standard electrode coordinates
-  (ASA `.elc` format, 97 points, RAS frame). Used by the verifier to check the
-  canonical invariants (Fp top / T3 left / T4 right / Cz nearest) against real
-  positions.
+  Takes an ASA `.elc` electrode file via `--elc PATH` (or `$GIZA_SERVER_ELC`)
+  and checks the canonical invariants (Fp top / T3 left / T4 right / Cz
+  nearest) against those positions; it needs the labels Fpz, Oz, Cz, T7, T8,
+  T3 and T4. No `.elc` is shipped here — MNE-Python carries suitable montages
+  under `channels/data/montages/`.
 - **foreground_giza_server.sh** — Helper to launch giza-server in the foreground.
 - **test_gs.c** — Minimal `/gs` client (PGPLOT C API) for checking the driver's
   auto-launch path from the outside: that the window outlives the client, and
@@ -55,8 +56,11 @@ If the XS loads but the wxWidgets dylibs are not found by dyld
 
 ## Verifying
 
-    perl tools/verify_wx_projection.pl --src tools/pdl_3d_wx.pl --elc tools/standard_1020.elc
+    perl tools/verify_wx_projection.pl --src tools/pdl_3d_wx.pl \
+         --elc /path/to/standard_1020.elc
     # -> 1..15, all ok
+
+Run it without `--elc` to get the message describing where to find one.
 
 ## Note: relationship to GS3D
 

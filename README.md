@@ -122,11 +122,12 @@ grouping (figures from the same client process share one window with a
 cairo-drawn tab bar — click to switch, per-tab `×` to close, WM-close discards
 the whole group), 3D frame rendering (lines, points, labels, thick-fill
 spans, and the z-buffer Gouraud triangle rasteriser — at parity with Cocoa),
-and the close-signals-the-client lifecycle; vector `File ▸ Save` and
-`RESIZE` resize replot are not yet wired on Xlib. The
+and the close-signals-the-client lifecycle. Vector `File ▸ Save`, `RESIZE`
+resize replot and 3D export are not implemented in the Xlib viewer, and its
+3D windows send no `PICK`. The
 **GTK** viewer is the original display-only backend (PNG frames, titles,
 persistence) — no sliders, save, mouse interaction, or tabs. On Linux, the
-default `./configure` now auto-detects **Xlib**, so you get the interactive
+default `./configure` auto-detects **Xlib**, so you get the interactive
 sliders, mouse zoom/pan, and tabs out of the box; the legacy GTK backend is
 still available via `--with-viewer=gtk` if you specifically need it.
 
@@ -190,6 +191,8 @@ typedef struct {
 | `ZOOM` | server→client | **none** (zoom/pan changed, optional notify) |
 | `CURSOR` | server→client | **none** (cursor moved, image fraction) |
 | `PICK` | server→client | **none** (mouse click, image fraction) |
+| `3D_FRAME` | client→server | ACK |
+| `3D_EXPORT` | server→client | **none** (client writes the file itself) |
 
 `SLIDER` carries a 5-byte packed `gsp_slider_t` payload (`uint8_t` slider id
 + `float` value), letting one message type drive any number of sliders. The
@@ -206,6 +209,13 @@ to the still-running client, which re-renders the current figure to the
 requested vector format and returns the bytes as `SAVEDATA`. Raster *Save as
 PNG* needs no round-trip — the viewer holds the last received PNG and writes
 it directly.
+
+*Save as PDF/SVG* is therefore available only while a client that answers
+`SAVEREQ` is alive — currently `PDL::Graphics::Cairo::Driver::GS` during a
+`show_interactive` session. The C `/gs` driver does not answer `SAVEREQ`: it
+sends its pages and exits, so a window left behind by a C program grays the
+vector entries out (its `client_fd` is already closed). *Save as PNG* keeps
+working there.
 
 `RESIZE` implements **resize replot**: when the user resizes a window whose
 client is still alive (an interactive session), the viewer coalesces the
@@ -226,8 +236,17 @@ reports activity back so the client can react:
   fractions** in `[0, 1]`: `(0, 0)` is the top-left of the rendered image and
   `(1, 1)` the bottom-right. The client converts to data coordinates using its
   own `xlim`/`ylim`.
-- `PICK(x, y, button)` — sent on a mouse-button press inside the plot, same
-  image-fraction convention; `button` is 1 = left, 2 = middle, 3 = right.
+- `PICK(x, y, button)` — sent on a mouse-button press inside the plot of a 2D
+  window (3D windows differ; see below), same
+  image-fraction convention. The `button` byte is **Cocoa's `buttonNumber + 1`**,
+  not the X11 numbering: **1 = left, 2 = right, 3 = middle**. Bit `0x10` is set
+  on a double-click. `Driver::GS3D` keys its seed removal on `button == 2`
+  (right). The Xlib viewer sends `button = 1` unconditionally and handles
+  Button2 (middle) locally as a zoom reset, so it never forwards it.
+  In a Cocoa **3D** window the `PICK` is sent on mouse-*up*, and only when the
+  pointer travelled less than 3px since the press, so it does not fire at the
+  end of a rotate-drag; the fractions are taken over the whole view, not the
+  2D letterbox rect. Xlib 3D windows send no `PICK` at all.
 - `ZOOM(zoom, pan_x, pan_y)` — sent when the zoom factor or pan offset
   changes (`zoom` 1.0 = fit, `pan_*` fractional offsets). Purely a notify;
   the client need not act on it.
@@ -523,10 +542,29 @@ follows the same pattern as the giza `/osx` driver (PR #86):
 ```
 viewer/
   giza-server-protocol.h   — GSP wire format (shared by driver + viewer)
+  gsp_3d.h                 — 3D frame payload layout (3D_FRAME = 0x24)
   giza-server-gtk.c        — GTK 3 viewer (Linux, legacy display-only)
   giza-server-xlib.c       — Xlib viewer (Linux, default; no GTK/GLib)
+  giza-server-xlib-3d.c    — Xlib 3D rasteriser (z-buffer, thick-fill)
   giza-server-cocoa.m      — Cocoa viewer (macOS)
   giza-server-main.m       — macOS main-thread bootstrapper
+tools/                     — see tools/README.md
+  test_gs.c                — minimal /gs client via the PGPLOT C API; checks
+                             the driver's auto-launch path from outside
+  bench_xlib_repaint.c     — reproduces and measures the Xlib 3D-repaint
+                             pathology (direct draw vs offscreen + coalesce)
+  pdl_3d_wx.pl             — PDL + wxWidgets 3D viewer
+  verify_wx_projection.pl  — headless check of pdl_3d_wx.pl's projection
+                             and trackball rotation; takes an ASA .elc
+                             electrode file via --elc (none is shipped —
+                             MNE-Python's channels/data/montages/ has some)
+  verify_server12.sh       — asserts the save-menu grayout and the
+                             close-signals-the-client sources are in place,
+                             builds, runs make check, and on Linux drives a
+                             synthetic window close to assert the client
+                             gets EOF
+  foreground_giza_server.sh — runs giza_server in the foreground so its
+                             stderr diagnostics are visible
 src/
   giza-driver-gs.c         — /gs device driver (add to libgiza)
   giza-driver-gs-private.h — driver header

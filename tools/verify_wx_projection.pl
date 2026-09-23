@@ -9,20 +9,46 @@
 #         - トラックボール seed が恒等 [1,0,0,0]
 #         - phi クランプ(1.57)が残っていない
 #         - クォータニオン・ヘルパ一式が存在
-#   (2) standard_1020.elc の実電極で:
+#   (2) ASA .elc の実電極で:
 #         - seed(恒等 q)で canonical: Fp上/O下/T3左/T4右/Cz手前/det>0
 #         - 剛体性: ランダムドラッグ列でも det(R)>0 & q正規化維持
 #         - 極なし: 連続縦ドラッグで Cz depth が符号反転を繰り返す
 #
-#   使い方: perl verify_wx_projection.pl [--src pdl_3d_wx.pl] [--elc standard_1020.elc]
+#   .elc は同梱しない。--elc か $GIZA_SERVER_ELC で実ファイルを渡す。
+#   ラベル Fpz/Oz/Cz/T7/T8/T3/T4 を含む 10-20 系のモンタージュが要る。
+#
+#   使い方: perl verify_wx_projection.pl --elc PATH [--src pdl_3d_wx.pl]
 #   依存: Test::More(コア)のみ。
 
 use strict; use warnings;
 use Test::More;
 use Getopt::Long;
 
-my $SRC='pdl_3d_wx.pl'; my $ELC='standard_1020.elc';
+my $SRC='pdl_3d_wx.pl'; my $ELC=$ENV{GIZA_SERVER_ELC};
 GetOptions('src=s'=>\$SRC,'elc=s'=>\$ELC);
+
+unless (defined $ELC && length $ELC) {
+    print STDERR <<'USAGE';
+verify_wx_projection.pl: no electrode file given.
+
+Pass an ASA .elc montage with --elc PATH, or set $GIZA_SERVER_ELC.
+This repository does not ship one.
+
+MNE-Python carries suitable montages. To locate them:
+
+    python3 -c "import importlib.util,os;print(os.path.dirname(importlib.util.find_spec('mne').origin))"
+
+and look under channels/data/montages/ for standard_1020.elc
+(renamed colin27_1020.elc in MNE 1.13).
+
+    perl tools/verify_wx_projection.pl --elc /path/to/standard_1020.elc
+USAGE
+    exit 2;
+}
+unless (-r $ELC) {
+    print STDERR "verify_wx_projection.pl: cannot read electrode file: $ELC\n";
+    exit 2;
+}
 
 # ---------- (1) 静的チェック ----------
 SKIP: {
@@ -74,8 +100,8 @@ sub parse_elc { my ($path)=@_;
     return (\@pos,\@lab) }
 
 # ---------- (2) 実電極での検証 ----------
-SKIP: {
-    unless (-r $ELC) { skip "$ELC not readable", 9; }
+# $ELC は起動時に存在と可読性を確認済み(未指定なら exit 2)。
+{
     my ($pos,$lab)=parse_elc($ELC);
     my %i; $i{$lab->[$_]}=$_ for 0..$#$lab;
     is(scalar @$pos,scalar @$lab,"elc: positions == labels");
