@@ -51,6 +51,7 @@ giza-server-saved*.png
 /examples/client_slider
 /examples/client_mouse
 client_mouse
+client_slider
 *.backup
 *.o
 *.orig
