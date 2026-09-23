@@ -412,7 +412,7 @@ frequency, vertical for amplitude. Dragging either one recomputes the wave
 on the client and pushes a new frame back to the window, live:
 
 ```bash
-# build (cairo required; the relative include resolves ../viewer/protocol.h)
+# build (cairo required; the relative include resolves ../viewer/giza-server-protocol.h)
 clang examples/client_slider.c \
   $(pkg-config --cflags --libs cairo) -o client_slider
 
@@ -438,7 +438,7 @@ image fractions in `[0, 1]`, which the client converts to data coordinates
 using the plot rectangle it drew into.
 
 ```bash
-# build (cairo required; the relative include resolves ../viewer/protocol.h)
+# build (cairo required; the relative include resolves ../viewer/giza-server-protocol.h)
 clang examples/client_mouse.c \
   $(pkg-config --cflags --libs cairo) -lm -o client_mouse
 
