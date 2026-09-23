@@ -75,6 +75,15 @@ pass as they are; the Fortran tests need the upstream fix from PR #124
 (`../../src/libgiza.la` added to `LDADD` in `test/F90/Makefile.am`) in order to
 link, and pass once it is applied.
 
+The descriptors the launched server inherits were checked on **Ubuntu 24.04.5
+LTS aarch64** (Parallels VM, Xlib viewer, 2026-09-23), against a giza 2.0.0
+patched as described under **Registering the `/gs` device in giza**. The `/gs`
+window appears and stays up after the client exits. `TMPDIR` is unset there,
+so the server's stderr lands in `/tmp/giza_server_<uid>.log` with mode 600.
+`./tools/test_gs 2>&1 | cat` returns with exit 0, and with
+`GIZA_SERVER=/nonexistent` the client gets `cpgopen -> -1` without hanging,
+while the log carries a single `could not exec giza_server` line.
+
 ## Backends
 
 The viewer is a **standalone binary** (`giza_server`) separate from the `/gs`
