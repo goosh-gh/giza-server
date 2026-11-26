@@ -82,6 +82,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>        /* clock_gettime: opt-in page timing */
 #include "giza-server-protocol.h"
 #include "gsp_3d.h"   /* Phase 2: 3D message types (0x24-0x27) */
 
@@ -107,6 +108,38 @@ static void _cursor_send(int win_id, float fx, float fy, uint8_t buttons, uint8_
 static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
 static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
                            uint8_t type, uint8_t key);   /* Phase 2 */
+
+/* ---- Per-page timing and ACK after drawing (opt-in, for measurement) ----
+ * Same environment variables and line format as gsp_wgpu (timing.rs):
+ *   GSP_ACK_AFTER_PRESENT=1  ACK a PNG only after drawRect: has drawn it
+ *                            (default: ACK on receipt, before decoding).
+ *                            Not drawn within 1 s (e.g. a minimized window):
+ *                            ACKed anyway, so the client never hangs.
+ *   GSP_TIMING_LOG=/path     append one line per PNG:
+ *     png server=cocoa win=0 bytes=48211 px=500x350 recv=.. decoded=.. drawn=.. ack=after outcome=drawn
+ * Times are ms since the server started (CLOCK_MONOTONIC). "decoded" is
+ * after [[NSImage alloc] initWithData:], which does not decode the pixels
+ * (drawInRect: does), so only recv -> drawn compares with gsp_wgpu.
+ * "drawn" is when drawRect: returned, not when the display scanned it out.
+ * outcome: drawn | superseded (a newer page came first) | timeout.
+ * 3D_FRAMEs (0003) give the same line with "f3d" first and
+ * px=<lines>l/<points>p/<triangles>t; "decoded" is when the frame was
+ * handed to the view; "drawn" when drawRect: (_draw3DFrame) returned.
+ * With neither variable set nothing changes. Both are read once, in
+ * giza_server_cocoa_init, before any other thread starts. */
+@class GsView;
+static int    gsp_ack_after = 0;
+static FILE  *gsp_tlog      = NULL;
+static double gsp_t0_ms     = 0.0;
+static double _gsp_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6 - gsp_t0_ms;
+}
+static void _gsp_page_drawn(GsView *view);     /* defined after GsWindow */
+static int  _send_msg(int fd, uint8_t type, uint32_t seq,
+                      const void *payload, uint32_t plen);
 
 /* Live-drag fires windowDidResize: continuously; coalesce the burst and
  * emit one RESIZE this long after the last event (drag settled). Each
@@ -369,6 +402,8 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
      * never runs for a 3D window. */
     if (_is_3d) {
         [self _draw3DFrame];
+        /* opt-in timing: the frame is drawn; send its owed ACK, if any */
+        if (gsp_tlog || gsp_ack_after) _gsp_page_drawn(self);
         return;
     }
 
@@ -398,6 +433,9 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
             dst.origin.x + dst.size.width - lb.size.width - margin,
             dst.origin.y + dst.size.height - lb.size.height - margin)];
     }
+
+    /* opt-in timing: the page is drawn; send its owed ACK, if any */
+    if (gsp_tlog || gsp_ack_after) _gsp_page_drawn(self);
 }
 
 /* --- Phase 2 (案③): z-buffer triangle rasteriser -----------------------
@@ -1049,6 +1087,16 @@ typedef struct {
     char           *save_path;    /* pending vector-save destination (malloc'd, NULL if none) */
     uint8_t         save_fmt;     /* GSP_SAVE_FMT_* for the pending save  */
     int             is_3d;        /* Phase 2: latched 1 on first GSP_MSG_3D_FRAME */
+    /* opt-in page timing (GSP_TIMING_LOG / GSP_ACK_AFTER_PRESENT);
+     * touched on the main thread only */
+    int             tm_pending;   /* a page is set but not drawn yet      */
+    int             tm_ack;       /* 1: that page's ACK is still owed     */
+    unsigned        tm_token;     /* bumped per page, for the ACK timeout */
+    uint32_t        tm_bytes;
+    int             tm_w, tm_h;   /* page size in pixels                  */
+    int             tm_3d;        /* 1: a 3D_FRAME (line "f3d"), 0: a PNG */
+    unsigned        tm_nl, tm_np, tm_nt;  /* 3D: lines, points, triangles */
+    double          tm_recv, tm_dec;
 } GsWindow;
 
 /* ------------------------------------------------------------------ */
@@ -1568,6 +1616,16 @@ void giza_server_cocoa_init(void)
     fprintf(stderr, "giza_server (cocoa): build %s\n", GIZA_SERVER_BUILD_STAMP);
     fflush(stderr);
 
+    /* opt-in page timing (see gsp_ack_after); read before threads start */
+    gsp_t0_ms = 0.0;
+    gsp_t0_ms = _gsp_now_ms();
+    {
+        const char *e = getenv("GSP_ACK_AFTER_PRESENT");
+        gsp_ack_after = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+        const char *p = getenv("GSP_TIMING_LOG");
+        if (p && p[0]) gsp_tlog = fopen(p, "a");
+    }
+
     memset(&GS, 0, sizeof(GS));
     pthread_mutex_init(&GS.wins_lock, NULL);
     GS.listen_fd = -1;
@@ -1790,16 +1848,65 @@ static int _create_window_sync(int w_px, int h_px, const char *title,
 /* PNG update - decode NSImage from memory, push to view               */
 /* ------------------------------------------------------------------ */
 
-static void _update_window(int win_id, const char *png_data, size_t png_len,
-                            const char *title)
+/* ---- opt-in page timing (see the comment at gsp_ack_after) ---- */
+
+/* Send the ACK owed for w's page (GSP_ACK_AFTER_PRESENT). Main thread;
+ * serialized with the reader thread's ACKs through write_lock. */
+static void _gsp_send_owed_ack(GsWindow *w)
 {
-    if (win_id < 0 || win_id >= GS.n_wins) return;
+    pthread_mutex_lock(&w->write_lock);
+    if (w->client_fd >= 0)
+        _send_msg(w->client_fd, GSP_MSG_ACK, w->seq_out++, NULL, 0);
+    pthread_mutex_unlock(&w->write_lock);
+}
+
+/* Write w's timing line and send its owed ACK. drawn < 0: not drawn. */
+static void _gsp_finish(GsWindow *w, double drawn, const char *outcome)
+{
+    if (gsp_tlog) {
+        char d[32], px[48];
+        if (drawn >= 0.0) snprintf(d, sizeof(d), "%.3f", drawn);
+        else              snprintf(d, sizeof(d), "NA");
+        if (w->tm_3d) snprintf(px, sizeof(px), "%ul/%up/%ut", w->tm_nl, w->tm_np, w->tm_nt);
+        else          snprintf(px, sizeof(px), "%dx%d", w->tm_w, w->tm_h);
+        fprintf(gsp_tlog,
+                "%s server=cocoa win=%d bytes=%u px=%s recv=%.3f decoded=%.3f"
+                " drawn=%s ack=%s outcome=%s\n",
+                w->tm_3d ? "f3d" : "png", w->id, (unsigned)w->tm_bytes, px,
+                w->tm_recv, w->tm_dec, d, w->tm_ack ? "after" : "before", outcome);
+        fflush(gsp_tlog);
+    }
+    int owed = w->tm_ack;
+    w->tm_pending = 0;
+    w->tm_ack     = 0;
+    if (owed) _gsp_send_owed_ack(w);
+}
+
+/* Called at the end of GsView's 2D drawRect: (main thread). */
+static void _gsp_page_drawn(GsView *view)
+{
+    for (int i = 0; i < GS.n_wins; i++) {
+        GsWindow *w = &GS.wins[i];
+        if (w->alive && w->view == view && w->tm_pending) {
+            _gsp_finish(w, _gsp_now_ms(), "drawn");
+            return;
+        }
+    }
+}
+
+/* Returns 1 if the PNG's ACK was taken over (defer_ack and the page was
+ * handed to the main thread, which sends it after drawing), else 0: the
+ * caller sends the ACK now, as before. */
+static int _update_window(int win_id, const char *png_data, size_t png_len,
+                          const char *title, double t_recv, int defer_ack)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return 0;
     GsWindow *w = &GS.wins[win_id];
-    if (!w->alive) return;
+    if (!w->alive) return 0;
 
     /* Copy data so the block can own it */
     char  *buf  = malloc(png_len);
-    if (!buf) return;
+    if (!buf) return 0;
     memcpy(buf, png_data, png_len);
 
 
@@ -1818,6 +1925,9 @@ static void _update_window(int win_id, const char *png_data, size_t png_len,
         if (!wptr->alive || wptr->view != view) {
             free(buf);
             if (ns_title) [ns_title release];
+            /* closed meanwhile: client_fd is -1, so this sends nothing,
+             * and the client sees the connection shut down */
+            if (defer_ack) _gsp_send_owed_ack(wptr);
             return;
         }
 
@@ -1826,6 +1936,25 @@ static void _update_window(int win_id, const char *png_data, size_t png_len,
                                        freeWhenDone:YES];
         NSImage *img  = [[NSImage alloc] initWithData:data];
         if (img) {
+            if (gsp_tlog || defer_ack) {
+                if (wptr->tm_pending) _gsp_finish(wptr, -1.0, "superseded");
+                NSImageRep *rep = [[img representations] firstObject];
+                wptr->tm_pending = 1;
+                wptr->tm_ack     = defer_ack;
+                wptr->tm_3d      = 0;
+                wptr->tm_bytes   = (uint32_t)png_len;
+                wptr->tm_w       = rep ? (int)[rep pixelsWide] : 0;
+                wptr->tm_h       = rep ? (int)[rep pixelsHigh] : 0;
+                wptr->tm_recv    = t_recv;
+                wptr->tm_dec     = _gsp_now_ms();
+                unsigned token   = ++wptr->tm_token;
+                if (defer_ack)
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                                   dispatch_get_main_queue(), ^{
+                        if (wptr->tm_pending && wptr->tm_token == token)
+                            _gsp_finish(wptr, -1.0, "timeout");
+                    });
+            }
             [view setImage:img];
             [img release];
 
@@ -1840,16 +1969,14 @@ static void _update_window(int win_id, const char *png_data, size_t png_len,
             [old release];
         } else {
             fprintf(stderr, "giza_server: PNG decode failed\n");
+            if (defer_ack) _gsp_send_owed_ack(wptr);
         }
         if (ns_title) {
             [window setTitle:ns_title];
             [ns_title release];
         }
     });
-
-
-
-
+    return defer_ack;
 }
 
 /* --- Phase 2: 3D mode ---
@@ -1867,11 +1994,35 @@ static void _update_window(int win_id, const char *png_data, size_t png_len,
  * separate clear/add steps (driven by now-retired GSP_MSG_3D_LABEL
  * messages) are what let drawRect: observe a half-updated label set;
  * folding labels into this one NSData removes that window entirely. */
-static void _update_window_3d(int win_id, const char *payload, size_t len)
+/* opt-in timing: the triangle count of a 3D_FRAME payload, found the way
+ * _draw3DFrame finds the section (0 if flags bit3 is off or it is cut short). */
+static unsigned _gsp_count_tris(const uint8_t *buf, size_t len)
 {
-    if (win_id < 0 || win_id >= GS.n_wins) return;
+    if (len < sizeof(gsp_3d_frame_hdr_t)) return 0;
+    gsp_3d_frame_hdr_t hdr;
+    memcpy(&hdr, buf, sizeof(hdr));
+    if (!(hdr.flags & 0x08)) return 0;
+    const uint8_t *p   = buf + sizeof(hdr)
+                       + (size_t)hdr.n_lines  * sizeof(gsp_3d_line_t)
+                       + (size_t)hdr.n_points * sizeof(gsp_3d_point_t);
+    const uint8_t *end = buf + len;
+    if (p + 2 > end) return 0;
+    uint16_t n_labels; memcpy(&n_labels, p, 2); p += 2;
+    for (uint16_t i = 0; i < n_labels && p + 14 <= end; i++)
+        p += 14 + (size_t)p[13];
+    if (p + 2 > end) return 0;
+    uint16_t n_tris; memcpy(&n_tris, p, 2);
+    return n_tris;
+}
+
+/* Returns 1 if the frame's ACK was taken over (defer_ack: the main thread
+ * sends it after drawing), else 0: the caller ACKs now, as before. */
+static int _update_window_3d(int win_id, const char *payload, size_t len,
+                             double t_recv, int defer_ack)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return 0;
     GsWindow *w = &GS.wins[win_id];
-    if (!w->alive) return;
+    if (!w->alive) return 0;
 
     NSData *data = [[NSData alloc] initWithBytes:payload length:len];
     GsView *view = w->view;
@@ -1880,10 +2031,38 @@ static void _update_window_3d(int win_id, const char *payload, size_t len)
     dispatch_async(dispatch_get_main_queue(), ^{
         /* Re-check on the main thread: windowWillClose: may have run in
          * the meantime (red-button close), same guard as _update_window. */
-        if (!wptr->alive || wptr->view != view) { [data release]; return; }
+        if (!wptr->alive || wptr->view != view) {
+            [data release];
+            if (defer_ack) _gsp_send_owed_ack(wptr);   /* client_fd is -1: no-op */
+            return;
+        }
+        if (gsp_tlog || defer_ack) {
+            if (wptr->tm_pending) _gsp_finish(wptr, -1.0, "superseded");
+            const uint8_t *b = (const uint8_t *)[data bytes];
+            size_t         n = [data length];
+            uint16_t nl = 0, np = 0;
+            if (n >= 4) { memcpy(&nl, b, 2); memcpy(&np, b + 2, 2); }
+            wptr->tm_pending = 1;
+            wptr->tm_ack     = defer_ack;
+            wptr->tm_3d      = 1;
+            wptr->tm_bytes   = (uint32_t)n;
+            wptr->tm_nl      = nl;
+            wptr->tm_np      = np;
+            wptr->tm_nt      = _gsp_count_tris(b, n);
+            wptr->tm_recv    = t_recv;
+            wptr->tm_dec     = _gsp_now_ms();
+            unsigned token   = ++wptr->tm_token;
+            if (defer_ack)
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                               dispatch_get_main_queue(), ^{
+                    if (wptr->tm_pending && wptr->tm_token == token)
+                        _gsp_finish(wptr, -1.0, "timeout");
+                });
+        }
         [view set3DPayload:data];
         [data release];
     });
+    return defer_ack;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2185,6 +2364,7 @@ static void *_handle_connection(void *arg)
                 free(payload); break;
             }
         }
+        double t_recv = _gsp_now_ms();   /* opt-in page timing */
 
         switch (hdr.type) {
 
@@ -2246,11 +2426,18 @@ static void *_handle_connection(void *arg)
                  current_win = _create_window_sync(800, 600, "giza", fd,
                                                    peer_pid, dflt_init);
              }
+            int ack_taken = 0;
             if (current_win >= 0) {
-                _update_window(current_win, payload, hdr.length, title_buf);
-                payload = NULL;
+                /* _update_window copies the bytes; payload is freed below
+                 * like every other message's (it used to be set to NULL
+                 * here, which leaked every PNG received). */
+                ack_taken = _update_window(current_win, payload, hdr.length,
+                                           title_buf, t_recv, gsp_ack_after);
             }
-            _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
+            /* default: ACK on receipt, before decoding. With
+             * GSP_ACK_AFTER_PRESENT the main thread ACKs after drawing. */
+            if (!ack_taken)
+                _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
             break;
         }
 
@@ -2275,11 +2462,16 @@ static void *_handle_connection(void *arg)
          * _draw3DFrame parses and draws a fully-consistent snapshot -
          * no separate clear/add steps, no partial-state window. */
         case GSP_MSG_3D_FRAME: {
+            int ack_taken = 0;
             if (current_win >= 0) {
                 GS.wins[current_win].is_3d = 1;
-                _update_window_3d(current_win, payload, hdr.length);
+                ack_taken = _update_window_3d(current_win, payload, hdr.length,
+                                              t_recv, gsp_ack_after);
             }
-            _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
+            /* default: ACK on receipt. With GSP_ACK_AFTER_PRESENT the main
+             * thread ACKs after drawRect: has drawn the frame. */
+            if (!ack_taken)
+                _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
             break;
         }
 
