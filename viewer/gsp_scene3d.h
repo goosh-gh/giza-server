@@ -67,6 +67,16 @@ int gsp_scene3d_set_view(gsp_scene3d_t *sc, const void *payload, size_t len);
 /* Rotate as a drag of (dx, dy) screen pixels does in GS3D (dy: up positive). */
 void gsp_scene3d_drag(gsp_scene3d_t *sc, double dx, double dy);
 
+/* Apply one GSP_MSG_3D_INPUT record as GS3D::run does: drag rotates,
+ * zoom *= 1 + dzoom * 0.1 when |dzoom| > 0.01, key 'p'/'P' toggles the
+ * projection, 'r'/'R' resets the pose and zoom (pivot kept). Returns a mask:
+ * GSP_SCENE3D_POSE_CHANGED when the view changed (send GSP_MSG_3D_POSE),
+ * GSP_SCENE3D_FORWARD for any other key (pass the record on to the client,
+ * e.g. 'c' and 'u', which clear and undo the client's seeds). */
+#define GSP_SCENE3D_POSE_CHANGED 0x01
+#define GSP_SCENE3D_FORWARD      0x02
+int gsp_scene3d_input(gsp_scene3d_t *sc, const gsp_3d_input_t *in);
+
 /* Draw every mesh into px (w*h RGBA, row 0 = top), zb (w*h) and, when not
  * NULL, ids (w*h; (mesh_id << 24) | face index, or GSP_SCENE3D_NO_ID). The
  * buffers are cleared first (transparent, far, no id). Returns the number of

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gsp_scene3d.h"
+#include "gs3d_drag_reference.h"   /* tools/gs3d_drag_reference.pl, from GS3D */
 
 static int failed = 0, run = 0;
 #define CHECK(cond, ...) do { run++; if (cond) printf("ok %d - ", run); \
@@ -191,6 +192,38 @@ int main(void)
         CHECK(gsp_scene3d_set_mesh(sc, far, sizeof far) == -1, "mesh_id out of range refused");
         gsp_3d_view_t v; memset(&v, 0, sizeof v);
         CHECK(gsp_scene3d_set_view(sc, &v, sizeof v) == -1, "zero quaternion refused");
+        gsp_scene3d_free(sc);
+    }
+
+    /* ---- the same 120 inputs (drags, wheel, 'p', 'r') as GS3D: poses agree ----
+     * Expected poses come from PDL::Graphics::Cairo::Driver::GS3D itself
+     * (tools/gs3d_drag_reference.pl), so this checks stage B against stage A. */
+    {
+        gsp_scene3d_t *sc = gsp_scene3d_new();
+        size_t nsteps = sizeof drag_steps / sizeof drag_steps[0], c = 0;
+        double worst = 0;
+        int bad_mask = 0;
+        for (size_t i = 0; i < nsteps; i++) {
+            gsp_3d_input_t in = { drag_steps[i].dx, drag_steps[i].dy, drag_steps[i].dzoom,
+                                  drag_steps[i].type, drag_steps[i].key };
+            int mask = gsp_scene3d_input(sc, &in);
+            if (!(mask & GSP_SCENE3D_POSE_CHANGED)) bad_mask++;
+            if (c < sizeof drag_checks / sizeof drag_checks[0] && drag_checks[c].step == (int)(i + 1)) {
+                const struct drag_check *k = &drag_checks[c++];
+                for (int j = 0; j < 4; j++) {
+                    double e = fabs(sc->view.q[j] - k->q[j]);
+                    if (e > worst) worst = e;
+                }
+                double ez = fabs(sc->view.zoom - k->zoom);
+                if (ez > worst) worst = ez;
+                if (sc->view.perspective != k->persp) worst = 1;
+            }
+        }
+        CHECK(c == sizeof drag_checks / sizeof drag_checks[0] && worst < 1e-5,
+              "120 inputs: quaternion, zoom and projection agree with GS3D at %zu checkpoints (max diff %.2g)", c, worst);
+        CHECK(bad_mask == 0, "every drag, wheel, 'p' and 'r' reports a pose change");
+        gsp_3d_input_t key_c = { 0, 0, 0, 2, 'c' };
+        CHECK(gsp_scene3d_input(sc, &key_c) == GSP_SCENE3D_FORWARD, "key 'c' is passed on to the client");
         gsp_scene3d_free(sc);
     }
 

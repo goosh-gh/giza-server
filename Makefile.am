@@ -37,6 +37,9 @@ if USE_XLIB
 giza_server_SOURCES = \
     viewer/giza-server-xlib.c \
     viewer/giza-server-xlib-3d.c \
+    viewer/gsp_scene3d.c \
+    viewer/gsp_scene3d.h \
+    viewer/gsp_raster.h \
     viewer/giza-server-protocol.h \
     viewer/gsp_3d.h
 
@@ -46,7 +49,7 @@ giza_server_CFLAGS  = \
 
 giza_server_LDADD   = \
     $(XLIB_LIBS) \
-    -lpng \
+    -lpng -lm \
     $(PTHREAD_LIBS)
 endif
 
@@ -83,8 +86,8 @@ test_test_png_CFLAGS   = -I$(srcdir)/viewer $(CAIRO_CFLAGS)
 test_test_png_LDADD    = $(CAIRO_LIBS)
 
 # Stage B 3D scene core (pure C, no window): built and run on every backend.
-test_test_scene3d_SOURCES = test/test_scene3d.c viewer/gsp_scene3d.c \
-    viewer/gsp_scene3d.h viewer/gsp_raster.h viewer/gsp_3d.h
+test_test_scene3d_SOURCES = test/test_scene3d.c test/gs3d_drag_reference.h \
+    viewer/gsp_scene3d.c viewer/gsp_scene3d.h viewer/gsp_raster.h viewer/gsp_3d.h
 test_test_scene3d_CFLAGS  = -I$(srcdir)/viewer
 test_test_scene3d_LDADD   = -lm
 
@@ -110,6 +113,8 @@ EXTRA_DIST = \
     giza-gs-driver.patch.annotation \
     test/test_ping.sh \
     test/test_png.sh \
+    tools/gs3d_drag_reference.pl \
+    tools/stage_b_client.pl \
     README.md \
     CHANGES.md
 

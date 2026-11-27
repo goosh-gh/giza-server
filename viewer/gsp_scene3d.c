@@ -170,6 +170,32 @@ void gsp_scene3d_drag(gsp_scene3d_t *sc, double dx, double dy)
     for (int i = 0; i < 4; i++) sc->view.q[i] = (float)(r[i] / n);
 }
 
+int gsp_scene3d_input(gsp_scene3d_t *sc, const gsp_3d_input_t *in)
+{
+    int out = 0;
+    if (in->type == 2) {
+        if (in->key == 'p' || in->key == 'P') {
+            sc->view.perspective = !sc->view.perspective;
+            return GSP_SCENE3D_POSE_CHANGED;
+        }
+        if (in->key == 'r' || in->key == 'R') {
+            sc->view.q[0] = 0; sc->view.q[1] = 0; sc->view.q[2] = 0; sc->view.q[3] = 1;
+            sc->view.zoom = 1;
+            return GSP_SCENE3D_POSE_CHANGED;
+        }
+        out |= GSP_SCENE3D_FORWARD;
+    }
+    if (in->dx != 0 || in->dy != 0) {
+        gsp_scene3d_drag(sc, in->dx, in->dy);
+        out |= GSP_SCENE3D_POSE_CHANGED;
+    }
+    if (fabs(in->dzoom) > 0.01) {
+        sc->view.zoom = (float)(sc->view.zoom * (1 + in->dzoom * 0.1));
+        out |= GSP_SCENE3D_POSE_CHANGED;
+    }
+    return out;
+}
+
 /* R from (w, x, y, z), rows as GS3D::_q_to_rot (normalised first). */
 static void q_to_rot(double w, double x, double y, double z, double R[9])
 {

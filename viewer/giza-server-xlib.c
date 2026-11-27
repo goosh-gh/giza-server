@@ -30,6 +30,7 @@
 #include <cairo-xlib.h>
 
 #include "gsp_3d.h"        /* Phase 2: 3D メッセージ型 (0x24-0x27) */
+#include "gsp_scene3d.h"   /* stage B: meshes sent once, drawn here */
 
 /* giza-server-xlib-3d.c: 3D フレームを cairo で描く純粋関数。
  * サーバ状態には触れない。Y は反転しない(cairo/X11 と Driver::GS3D の
@@ -105,6 +106,7 @@ typedef enum {
     CMD_CLOSE,     /* close a window                                  */
     CMD_SAVEPATH,  /* write vector bytes (SAVEDATA) to disk           */
     CMD_3D_FRAME,  /* Phase 2: raw GSP_MSG_3D_FRAME payload            */
+    CMD_3D_SCENE,  /* stage B: GSP_MSG_3D_MESH/COLORS/VIEW/OVERLAY payload */
 } CmdType;
 
 typedef struct {
@@ -121,6 +123,7 @@ typedef struct {
     size_t           save_len;                    /* CMD_SAVEPATH      */
     unsigned char   *p3d;                         /* CMD_3D_FRAME (malloc'd, handed off) */
     size_t           p3d_len;                     /* CMD_3D_FRAME      */
+    uint8_t          msg;                         /* CMD_3D_SCENE: GSP_MSG_3D_* type */
     int             *result;                      /* optional reply slot */
     pthread_mutex_t *result_mu;
     pthread_cond_t  *result_cv;
@@ -175,6 +178,19 @@ typedef struct {
     int              is_3d;
     unsigned char   *p3d;          /* 最新フレームの生ペイロード (malloc'd) */
     size_t           p3d_len;
+
+    /* Stage B (main thread only). scene is created by the first
+     * GSP_MSG_3D_MESH/VIEW; from then on the tab draws the scene instead of
+     * p3d, and drag/wheel/'p'/'r' change the pose here (sent back as
+     * GSP_MSG_3D_POSE). scene_ids is the id buffer of the last frame, for
+     * click (GSP_MSG_3D_PICKV) and hover (GSP_MSG_3D_HOVERV). */
+    gsp_scene3d_t   *scene;
+    uint32_t        *scene_ids;
+    int              scene_w, scene_h;
+    int              press_x, press_y;   /* button press position: click or drag */
+    int              hover_ok;
+    uint8_t          hover_m;
+    uint32_t         hover_v;
 } GsWindow;
 
 /* A GsContainer owns one X top-level window and groups 1..N tabs (figures)
@@ -609,6 +625,45 @@ _tabbar_hit(GsContainer *c, const int *tabs, int n, int ex, int ey,
     return tabs[i];
 }
 
+/* Stage B: draw the tab's scene into a bw x bh RGBA buffer with the shared
+ * core (gsp_scene3d.c), keep its id buffer for pick/hover, and paint it at
+ * (bx, by). Transparent pixels (nothing drawn) show the white background. */
+static void
+_draw_scene(cairo_t *cr, GsWindow *win, int bx, int by, int bw, int bh)
+{
+    if (bw <= 0 || bh <= 0) return;
+    size_t npx = (size_t)bw * bh;
+    uint8_t *px = malloc(npx * 4);
+    float   *zb = malloc(npx * sizeof(float));
+    if (win->scene_w != bw || win->scene_h != bh) {
+        free(win->scene_ids);
+        win->scene_ids = malloc(npx * sizeof(uint32_t));
+        win->scene_w = win->scene_ids ? bw : 0;
+        win->scene_h = win->scene_ids ? bh : 0;
+    }
+    if (px && zb && win->scene_ids &&
+        gsp_scene3d_render(win->scene, bw, bh, px, zb, win->scene_ids) >= 0) {
+        cairo_surface_t *img = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, bw, bh);
+        if (cairo_surface_status(img) == CAIRO_STATUS_SUCCESS) {
+            unsigned char *dst = cairo_image_surface_get_data(img);
+            int stride = cairo_image_surface_get_stride(img);
+            cairo_surface_flush(img);
+            for (int y = 0; y < bh; y++) {
+                uint32_t *row = (uint32_t *)(dst + (size_t)y * stride);
+                const uint8_t *s = px + (size_t)y * bw * 4;
+                for (int x = 0; x < bw; x++, s += 4)      /* alpha is 0 or 255: no premultiply */
+                    row[x] = s[3] ? (0xFF000000u | ((uint32_t)s[0] << 16) | ((uint32_t)s[1] << 8) | s[2]) : 0;
+            }
+            cairo_surface_mark_dirty(img);
+            cairo_set_source_surface(cr, img, bx, by);
+            cairo_paint(cr);
+        }
+        cairo_surface_destroy(img);
+    }
+    free(px);
+    free(zb);
+}
+
 /* Repaint a container: clear, paint the active tab's surface + sliders into
  * the body, then the tab bar on top (if 2+ tabs). */
 static void
@@ -653,7 +708,9 @@ _repaint_container(GsContainer *c)
     /* Phase 2: 3D タブは PNG サーフェスを持たない。ペイロードを cairo で
      * 直接描く。スライダ帯は 3D では意味がないので出さない(タブバーは
      * 下の共通処理でそのまま描かれる)。 */
-    if (win && win->is_3d) {
+    if (win && win->is_3d && win->scene) {
+        _draw_scene(cr, win, bx, by, bw, bh);
+    } else if (win && win->is_3d) {
         gsp3d_draw_cairo(cr, (double)bx, (double)by,
                              (double)bw, (double)bh,
                              win->p3d, win->p3d_len);
@@ -755,6 +812,12 @@ _close_tab(int id, int user_initiated)
     win->p3d       = NULL;
     win->p3d_len   = 0;
     win->is_3d     = 0;
+    gsp_scene3d_free(win->scene); /* stage B */
+    win->scene     = NULL;
+    free(win->scene_ids);
+    win->scene_ids = NULL;
+    win->scene_w   = win->scene_h = 0;
+    win->hover_ok  = 0;
     pthread_mutex_destroy(&win->write_lock);
     win->alive     = 0;
     win->container = -1;
@@ -829,6 +892,32 @@ _dispatch(Cmd *cmd)
         } else {
             free(cmd->p3d);
         }
+        break;
+    }
+
+    case CMD_3D_SCENE: {
+        GsWindow *w3 = _find_or_create_win(cmd->win_id);
+        if (w3) {
+            if (!w3->scene) w3->scene = gsp_scene3d_new();
+            if (w3->scene) {
+                int rc = 0;
+                switch (cmd->msg) {
+                case GSP_MSG_3D_MESH:   rc = gsp_scene3d_set_mesh(w3->scene, cmd->p3d, cmd->p3d_len); break;
+                case GSP_MSG_3D_COLORS: rc = gsp_scene3d_set_colors(w3->scene, cmd->p3d, cmd->p3d_len); break;
+                case GSP_MSG_3D_VIEW:   rc = gsp_scene3d_set_view(w3->scene, cmd->p3d, cmd->p3d_len); break;
+                default: break;        /* GSP_MSG_3D_OVERLAY: accepted, not drawn yet */
+                }
+                if (rc < 0)
+                    fprintf(stderr, "giza_server: malformed 3D message 0x%02X (%zu bytes) ignored\n",
+                            cmd->msg, cmd->p3d_len);
+                w3->is_3d = 1;
+                w3->hover_ok = 0;
+                if (w3->container >= 0 && GS.conts[w3->container].alive)
+                    GS.conts[w3->container].repaint_pending = 1;
+            }
+        }
+        free(cmd->p3d);
+        cmd->p3d = NULL;
         break;
     }
 
@@ -971,6 +1060,73 @@ _3d_input_send_xlib(GsWindow *win, float dx, float dy, float dzoom,
     pthread_mutex_unlock(&win->write_lock);
 }
 
+/* Stage B: the pose after a local drag/wheel/'p'/'r' (GSP_MSG_3D_POSE). */
+static void
+_3d_pose_send_xlib(GsWindow *win)
+{
+    if (!win || !win->scene) return;
+    pthread_mutex_lock(&win->write_lock);
+    int fd = win->client_fd;
+    if (fd >= 0 && _send_hdr(fd, GSP_MSG_3D_POSE, (uint32_t)sizeof(gsp_3d_view_t), 0) == 0)
+        _write_exact(fd, &win->scene->view, sizeof(gsp_3d_view_t));
+    pthread_mutex_unlock(&win->write_lock);
+}
+
+/* Stage B: the vertex under a click (GSP_MSG_3D_PICKV) or under the pointer
+ * (GSP_MSG_3D_HOVERV, the same record without the button byte). */
+static void
+_3d_vertex_send_xlib(GsWindow *win, uint8_t type, uint8_t mesh_id, uint32_t vertex,
+                     uint8_t button, float fx, float fy)
+{
+    if (!win) return;
+    gsp_3d_pickv_t rec;
+    memset(&rec, 0, sizeof rec);
+    rec.mesh_id = mesh_id; rec.vertex = vertex; rec.button = button; rec.fx = fx; rec.fy = fy;
+    unsigned char buf[sizeof rec];
+    size_t n;
+    if (type == GSP_MSG_3D_PICKV) {
+        memcpy(buf, &rec, sizeof rec);
+        n = sizeof rec;
+    } else {                                  /* HOVERV: mesh_id, vertex, fx, fy (13 bytes) */
+        buf[0] = mesh_id;
+        memcpy(buf + 1, &vertex, 4);
+        memcpy(buf + 5, &fx, 4);
+        memcpy(buf + 9, &fy, 4);
+        n = 13;
+    }
+    pthread_mutex_lock(&win->write_lock);
+    int fd = win->client_fd;
+    if (fd >= 0 && _send_hdr(fd, type, (uint32_t)n, 0) == 0)
+        _write_exact(fd, buf, n);
+    pthread_mutex_unlock(&win->write_lock);
+}
+
+/* Stage B: the vertex under body pixel (x, y) of the last frame, or none. */
+static int
+_scene_vertex_at(GsWindow *win, int x, int y, uint8_t *mi, uint32_t *v)
+{
+    if (!win->scene || !win->scene_ids) return -1;
+    return gsp_scene3d_pick(win->scene, win->scene_ids, win->scene_w, win->scene_h, x, y, mi, v);
+}
+
+/* Stage B: apply one input record to the tab's scene; repaint and report the
+ * pose if it changed, pass other keys on to the client. */
+static void
+_scene_input(GsContainer *c, GsWindow *w3, float dx, float dy, float dzoom,
+             uint8_t type, uint8_t key)
+{
+    gsp_3d_input_t in;
+    memset(&in, 0, sizeof in);
+    in.dx = dx; in.dy = dy; in.dzoom = dzoom; in.type = type; in.key = key;
+    int r = gsp_scene3d_input(w3->scene, &in);
+    if (r & GSP_SCENE3D_POSE_CHANGED) {
+        _repaint_container(c);
+        _3d_pose_send_xlib(w3);
+    }
+    if (r & GSP_SCENE3D_FORWARD)
+        _3d_input_send_xlib(w3, dx, dy, dzoom, type, key);
+}
+
 /* コンテナのアクティブタブ(3D なら非 NULL)。3D 分岐の共通ヘルパ。 */
 static GsWindow *
 _active_3d_win(GsContainer *c)
@@ -1111,17 +1267,26 @@ _handle_xevent(XEvent *ev)
                      * run() は {zoom} *= (1 + dzoom*0.1) を掛けるので、
                      * ±1.0 で 1 ノッチ約 10%。 */
                     float dz = (ev->xbutton.button == Button4) ? 1.0f : -1.0f;
-                    _3d_input_send_xlib(w3, 0.0f, 0.0f, dz, /*wheel*/1, 0);
+                    if (w3->scene) _scene_input(c, w3, 0.0f, 0.0f, dz, /*wheel*/1, 0);
+                    else           _3d_input_send_xlib(w3, 0.0f, 0.0f, dz, /*wheel*/1, 0);
                     break;
                 }
                 if (ev->xbutton.button == Button1) {
                     c->dragging = 1;                 /* 3D は常にドラッグ可 */
                     c->drag_x   = ev->xbutton.x;
                     c->drag_y   = ev->xbutton.y;
+                    w3->press_x = ev->xbutton.x;     /* stage B: click if it barely moves */
+                    w3->press_y = ev->xbutton.y;
                     break;
                 }
                 if (ev->xbutton.button == Button2) { /* 中クリック = リセット */
-                    _3d_input_send_xlib(w3, 0.0f, 0.0f, 0.0f, /*key*/2, (uint8_t)'r');
+                    if (w3->scene) _scene_input(c, w3, 0.0f, 0.0f, 0.0f, /*key*/2, (uint8_t)'r');
+                    else           _3d_input_send_xlib(w3, 0.0f, 0.0f, 0.0f, /*key*/2, (uint8_t)'r');
+                    break;
+                }
+                if (ev->xbutton.button == Button3) { /* stage B: right click (unpick) on release */
+                    w3->press_x = ev->xbutton.x;
+                    w3->press_y = ev->xbutton.y;
                     break;
                 }
             }
@@ -1210,13 +1375,39 @@ _handle_xevent(XEvent *ev)
         char   buf[8];
         KeySym ks;
         int n = XLookupString(&ev->xkey, buf, sizeof(buf), &ks, NULL);
-        if (n > 0)
-            _3d_input_send_xlib(w3, 0.0f, 0.0f, 0.0f, /*key*/2, (uint8_t)buf[0]);
+        if (n > 0) {
+            if (w3->scene) _scene_input(c, w3, 0.0f, 0.0f, 0.0f, /*key*/2, (uint8_t)buf[0]);
+            else           _3d_input_send_xlib(w3, 0.0f, 0.0f, 0.0f, /*key*/2, (uint8_t)buf[0]);
+        }
         break;
     }
 
     case ButtonRelease: {
         GsContainer *c = _container_for_xwin(ev->xbutton.window);
+        /* Stage B: a press and release within 3 px is a click: send the
+         * vertex under it (left = 1, right = 2, as Cocoa's PICK button). */
+        {
+            GsWindow *w3 = _active_3d_win(c);
+            if (w3 && w3->scene &&
+                (ev->xbutton.button == Button1 || ev->xbutton.button == Button3)) {
+                int mdx = ev->xbutton.x - w3->press_x, mdy = ev->xbutton.y - w3->press_y;
+                if (mdx * mdx + mdy * mdy <= 9) {
+                    int tabs[MAX_WINDOWS];
+                    int nt = _container_tabs((int)(c - GS.conts), tabs, MAX_WINDOWS);
+                    int bx, by, bw, bh;
+                    _body_geom(c, nt, &bx, &by, &bw, &bh);
+                    uint8_t mi = 0; uint32_t v = 0xFFFFFFFFu;
+                    if (_scene_vertex_at(w3, ev->xbutton.x - bx, ev->xbutton.y - by, &mi, &v) < 0)
+                        v = 0xFFFFFFFFu;
+                    float fx = bw > 0 ? (float)(ev->xbutton.x - bx) / bw : 0;
+                    float fy = bh > 0 ? (float)(ev->xbutton.y - by) / bh : 0;
+                    _3d_vertex_send_xlib(w3, GSP_MSG_3D_PICKV, mi, v,
+                                         ev->xbutton.button == Button1 ? 1 : 2, fx, fy);
+                }
+                if (ev->xbutton.button == Button1) c->dragging = 0;
+                break;
+            }
+        }
         if (c && c->dragging) {
             c->dragging = 0;
             GsWindow *aw = (c->active >= 0 && GS.wins[c->active].alive)
@@ -1247,8 +1438,25 @@ _handle_xevent(XEvent *ev)
                 float dy = -(float)(ev->xmotion.y - c->drag_y);
                 c->drag_x = ev->xmotion.x;
                 c->drag_y = ev->xmotion.y;
-                if (dx != 0.0f || dy != 0.0f)
-                    _3d_input_send_xlib(w3, dx, dy, 0.0f, /*drag*/0, 0);
+                if (dx != 0.0f || dy != 0.0f) {
+                    if (w3->scene) _scene_input(c, w3, dx, dy, 0.0f, /*drag*/0, 0);
+                    else           _3d_input_send_xlib(w3, dx, dy, 0.0f, /*drag*/0, 0);
+                }
+                break;
+            }
+            /* Stage B hover: report the vertex under the pointer when it changes. */
+            if (w3 && w3->scene && !(ev->xmotion.state & (Button1Mask | Button3Mask))) {
+                int bx, by, bw, bh;
+                _body_geom(c, n, &bx, &by, &bw, &bh);
+                uint8_t mi = 0; uint32_t v = 0xFFFFFFFFu;
+                if (_scene_vertex_at(w3, ev->xmotion.x - bx, ev->xmotion.y - by, &mi, &v) < 0)
+                    v = 0xFFFFFFFFu;
+                if (!w3->hover_ok || v != w3->hover_v || mi != w3->hover_m) {
+                    w3->hover_ok = 1; w3->hover_v = v; w3->hover_m = mi;
+                    _3d_vertex_send_xlib(w3, GSP_MSG_3D_HOVERV, mi, v, 0,
+                                         bw > 0 ? (float)(ev->xmotion.x - bx) / bw : 0,
+                                         bh > 0 ? (float)(ev->xmotion.y - by) / bh : 0);
+                }
                 break;
             }
         }
@@ -1348,7 +1556,38 @@ _connection_thread(void *arg)
         switch (hdr.type) {
 
         case GSP_MSG_PING: {
-            _send_hdr(fd, GSP_MSG_PONG, 0, seq_out++);
+            /* A PING with a u32 payload of 1 asks for the capabilities:
+             * answer with the mask (stage B). A bare PING gets a bare PONG. */
+            uint32_t ask = 0;
+            if (len == 4) memcpy(&ask, payload, 4);
+            if (ask == 1) {
+                uint32_t caps = GSP_CAP_3D_SCENE;
+                if (_send_hdr_locked(wid, fd, GSP_MSG_PONG, 4, seq_out++) == 0)
+                    _write_exact(fd, &caps, 4);
+            } else {
+                _send_hdr(fd, GSP_MSG_PONG, 0, seq_out++);
+            }
+            break;
+        }
+
+        /* Stage B: hand the payload to the main thread (it owns the scene).
+         * MESH, COLORS and OVERLAY are ACKed on receipt, VIEW is not. */
+        case GSP_MSG_3D_MESH:
+        case GSP_MSG_3D_COLORS:
+        case GSP_MSG_3D_VIEW:
+        case GSP_MSG_3D_OVERLAY: {
+            Cmd *cmd = calloc(1, sizeof(Cmd));
+            if (!cmd) { free(payload); goto done; }
+            cmd->type    = CMD_3D_SCENE;
+            cmd->win_id  = wid;
+            cmd->msg     = hdr.type;
+            cmd->p3d     = payload;          /* ownership handed off */
+            cmd->p3d_len = len;
+            payload      = NULL;
+            uint8_t t    = hdr.type;
+            _send_cmd(cmd);
+            if (t != GSP_MSG_3D_VIEW)
+                _send_hdr_locked(wid, fd, GSP_MSG_ACK, 0, seq_out++);
             break;
         }
 

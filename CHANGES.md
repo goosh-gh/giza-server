@@ -8,7 +8,7 @@ grouped below under the backend/feature themes they belong to.
 
 ## Unreleased
 
-### Added — stage B 3D scene core (not yet used by the backends)
+### Added — stage B 3D scene core, used by the Xlib viewer
 
 `viewer/gsp_scene3d.c` keeps meshes sent once (`GSP_MSG_3D_MESH`, 0x29) with
 their colours (`GSP_MSG_3D_COLORS`, 0x2A) and a view (`GSP_MSG_3D_VIEW`,
@@ -20,8 +20,23 @@ poses the triangle counts are the same and no colour differs by more than 1.
 The messages 0x29–0x2F and the capability answer to a `PING` with a payload
 are defined in `viewer/gsp_3d.h`. `viewer/gsp_raster.h` holds the triangle
 rasterizer of the Xlib backend and a variant that also writes the id buffer.
-`make check` runs `test/test_scene3d` (24 checks, no window). The Cocoa and
-Xlib viewers do not use the core yet.
+`gsp_scene3d_input` applies a `GSP_MSG_3D_INPUT` record as `GS3D::run` does
+(drag, wheel, `p`, `r`) and tells which other keys to pass on to the client;
+over 120 inputs its pose agrees with GS3D's within 1.3e-7
+(`test/gs3d_drag_reference.h`, made by `tools/gs3d_drag_reference.pl`).
+`make check` runs `test/test_scene3d` (27 checks, no window).
+
+The Xlib viewer speaks stage B: it answers a `PING` with a payload with
+`GSP_CAP_3D_SCENE`, ACKs `3D_MESH`, `3D_COLORS` and `3D_OVERLAY` (the overlay
+is accepted but not drawn yet), and draws a tab's scene with the core. In
+such a tab a drag, the wheel, the middle button and the keys `p` and `r`
+change the pose in the viewer, which repaints and sends `GSP_MSG_3D_POSE`;
+other keys still go to the client as `GSP_MSG_3D_INPUT`. A left or right
+click (press and release within 3 px) sends `GSP_MSG_3D_PICKV` with the
+vertex under it, and pointer motion sends `GSP_MSG_3D_HOVERV` when the vertex
+under the pointer changes. `tools/stage_b_client.pl` is a client for trying
+this by hand. A tab that never gets a stage B message draws `3D_FRAME` as
+before. The Cocoa viewer does not use the core yet.
 
 ### Added — 2D double-click and press-drag reporting (Cocoa)
 
