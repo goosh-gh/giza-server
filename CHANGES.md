@@ -8,6 +8,21 @@ grouped below under the backend/feature themes they belong to.
 
 ## Unreleased
 
+### Added — stage B 3D scene core (not yet used by the backends)
+
+`viewer/gsp_scene3d.c` keeps meshes sent once (`GSP_MSG_3D_MESH`, 0x29) with
+their colours (`GSP_MSG_3D_COLORS`, 0x2A) and a view (`GSP_MSG_3D_VIEW`,
+0x2B), and draws them into an RGBA buffer with a z-buffer and an id buffer
+(the face under each pixel, for picking a vertex). Rotation, projection,
+culling and shading follow `PDL::Graphics::Cairo::Driver::GS3D`, so the
+picture matches its `3D_FRAME` triangles: on a 5,000-vertex test mesh at four
+poses the triangle counts are the same and no colour differs by more than 1.
+The messages 0x29–0x2F and the capability answer to a `PING` with a payload
+are defined in `viewer/gsp_3d.h`. `viewer/gsp_raster.h` holds the triangle
+rasterizer of the Xlib backend and a variant that also writes the id buffer.
+`make check` runs `test/test_scene3d` (24 checks, no window). The Cocoa and
+Xlib viewers do not use the core yet.
+
 ### Added — 2D double-click and press-drag reporting (Cocoa)
 
 The Cocoa viewer reports two more 2D gestures to the client. A double-click is

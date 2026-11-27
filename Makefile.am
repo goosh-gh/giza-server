@@ -72,7 +72,7 @@ endif
 # Test programs (built by 'make check', not installed)               #
 # ------------------------------------------------------------------ #
 
-check_PROGRAMS = test/test_ping test/test_png
+check_PROGRAMS = test/test_ping test/test_png test/test_scene3d
 
 test_test_ping_SOURCES = test/test_ping.c
 test_test_ping_CFLAGS  = -I$(srcdir)/viewer
@@ -82,11 +82,17 @@ test_test_png_SOURCES  = test/test_png.c
 test_test_png_CFLAGS   = -I$(srcdir)/viewer $(CAIRO_CFLAGS)
 test_test_png_LDADD    = $(CAIRO_LIBS)
 
+# Stage B 3D scene core (pure C, no window): built and run on every backend.
+test_test_scene3d_SOURCES = test/test_scene3d.c viewer/gsp_scene3d.c \
+    viewer/gsp_scene3d.h viewer/gsp_raster.h viewer/gsp_3d.h
+test_test_scene3d_CFLAGS  = -I$(srcdir)/viewer
+test_test_scene3d_LDADD   = -lm
+
 # ------------------------------------------------------------------ #
 # Test suite (automake TESTS)                                         #
 # ------------------------------------------------------------------ #
 
-TESTS = test/test_ping.sh test/test_png.sh
+TESTS = test/test_ping.sh test/test_png.sh test/test_scene3d
 
 TEST_EXTENSIONS = .sh
 SH_LOG_COMPILER = sh

@@ -192,4 +192,62 @@ typedef struct __attribute__((packed)) {
     /* char text[] follows -- NOT included in sizeof() */
 } gsp_3d_label_t;   /* 14 bytes fixed part */
 
+
+/* --------------------------------------------------------
+ * Stage B (2026-11): the mesh is sent once, then only the view, colours and
+ * overlays. The server keeps the mesh, rotates it on drag (and reports the
+ * pose), shades, z-tests and rasterizes it, and answers clicks with a vertex
+ * index from an id buffer. The client learns that the server speaks stage B
+ * from the answer to a PING with a 4-byte payload (u32 1 = "send your
+ * capabilities"): a stage B server answers PONG with a u32 capability mask
+ * (GSP_CAP_3D_SCENE); an older server answers an empty PONG. Messages that
+ * are ACKed (MESH, COLORS, OVERLAY) must only be sent to a stage B server.
+ * All numbers little-endian. Each message applies to the connection's
+ * current 3D window, as 3D_FRAME does. 0x28 is GSP_MSG_3D_EXPORT
+ * (giza-server-cocoa.m).
+ * -------------------------------------------------------- */
+#define GSP_CAP_3D_SCENE   0x00000001u
+
+#define GSP_MSG_3D_MESH    0x29  /* client -> server, ACK */
+#define GSP_MSG_3D_COLORS  0x2A  /* client -> server, ACK */
+#define GSP_MSG_3D_VIEW    0x2B  /* client -> server, no ACK, latest wins */
+#define GSP_MSG_3D_OVERLAY 0x2C  /* client -> server, ACK */
+#define GSP_MSG_3D_POSE    0x2D  /* server -> client, no ACK */
+#define GSP_MSG_3D_PICKV   0x2E  /* server -> client, no ACK */
+#define GSP_MSG_3D_HOVERV  0x2F  /* server -> client, no ACK */
+
+/* GSP_MSG_3D_MESH payload:
+ *   uint8_t  mesh_id      0..GSP_SCENE3D_MAX_MESH-1; the same id replaces
+ *   uint8_t  flags        GSP_MESH_*
+ *   uint32_t nv           vertices (0 = delete this mesh; nothing follows)
+ *   uint32_t nf           triangles
+ *   float    pos[nv][3]   model coordinates (mm)
+ *   float    nrm[nv][3]   unit outward vertex normals, only with GSP_MESH_NORMALS
+ *                         (without it the server computes them from the faces)
+ *   uint8_t  rgba[nv][4]  unshaded vertex colours (the server shades them)
+ *   uint32_t face[nf][3]  0-based vertex indices
+ */
+#define GSP_MESH_NORMALS     0x01
+#define GSP_MESH_TRANSLUCENT 0x02  /* reserved: drawn after opaque meshes, alpha from rgba */
+#define GSP_MESH_WINDING_CW  0x04  /* outward faces are clockwise (winding sign -1) */
+
+/* GSP_MSG_3D_COLORS payload: uint8_t mesh_id, uint32_t nv, uint8_t rgba[nv][4].
+ * Ignored when nv differs from the mesh's. */
+
+/* GSP_MSG_3D_VIEW and GSP_MSG_3D_POSE payload (33 bytes). */
+typedef struct __attribute__((packed)) {
+    float   q[4];         /* rotation quaternion (w, x, y, z); (0,0,0,1) = Cz from above */
+    float   zoom;
+    float   pivot[3];     /* model point moved to the origin before rotating */
+    uint8_t perspective;  /* 0 = orthographic, 1 = perspective */
+} gsp_3d_view_t;
+
+/* GSP_MSG_3D_PICKV payload (14 bytes); GSP_MSG_3D_HOVERV is the same without button. */
+typedef struct __attribute__((packed)) {
+    uint8_t  mesh_id;
+    uint32_t vertex;      /* 0xFFFFFFFF = none under the pointer */
+    uint8_t  button;      /* as GSP_MSG_PICK: left 1, right 2, middle 3, | 0x10 double click */
+    float    fx, fy;      /* position as a fraction of the full view bounds */
+} gsp_3d_pickv_t;
+
 #endif /* GSP_3D_H */
