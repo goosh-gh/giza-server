@@ -85,6 +85,7 @@
 #include <time.h>        /* clock_gettime: opt-in page timing */
 #include "giza-server-protocol.h"
 #include "gsp_3d.h"   /* Phase 2: 3D message types (0x24-0x27) */
+#include "gsp_scene3d.h"   /* stage B: meshes sent once, drawn here (shared with Xlib) */
 
 /* menu「Export OBJ/USDA」の逆チャネル型。canonical な定義は gsp_3d.h に
  * 置く(GS3D.pm と一致)。gsp_3d.h 未更新でもこの .m 単体でビルドできるよう
@@ -106,6 +107,9 @@ static void _3d_export_send(int win_id, uint8_t fmt, const char *path);   /* Pha
 static void _resize_send(int win_id, uint32_t width_px, uint32_t height_px);
 static void _cursor_send(int win_id, float fx, float fy, uint8_t buttons, uint8_t type);
 static void _zoom_send(int win_id, float zoom, float pan_x, float pan_y);
+static void _3d_pose_send(int win_id, const gsp_3d_view_t *view);   /* stage B */
+static void _3d_vertex_send(int win_id, uint8_t type, uint8_t mesh_id, uint32_t vertex,
+                            uint8_t button, float fx, float fy);   /* stage B: PICKV / HOVERV */
 static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
                            uint8_t type, uint8_t key);   /* Phase 2 */
 
@@ -188,6 +192,19 @@ static int  _send_msg(int fd, uint8_t type, uint32_t seq,
     NSData   *_3d_payload;       /* raw GSP_MSG_3D_FRAME payload (lines+points+labels), parsed in drawRect: */
     NSPoint   _rot_drag_start;   /* mouseDown point, 3D-rotate drag (separate from 2D _drag_start) */
     NSPoint   _3d_down_point;    /* 3D mouseDown point, to tell a click (pick) from a rotate-drag */
+
+    /* --- Stage B (gsp_scene3d.c, shared with the Xlib viewer) ---
+     * Created by the first GSP_MSG_3D_MESH/COLORS/VIEW/OVERLAY; from then on
+     * this view draws the scene instead of 3D_FRAME payloads, rotates it
+     * itself on drag/wheel/pinch/'p'/'r' (reporting GSP_MSG_3D_POSE) and
+     * answers clicks and hovers with vertex numbers from the id buffer.
+     * Main thread only (payloads are handed over with dispatch_async). */
+    gsp_scene3d_t *_scene;
+    uint32_t      *_scene_ids;   /* id buffer of the last frame, _scene_w x _scene_h */
+    int            _scene_w, _scene_h;
+    int            _hover_ok;    /* _hover_m/_hover_v hold the last HOVERV sent */
+    uint8_t        _hover_m;
+    uint32_t       _hover_v;
 }
 - (void)setImage:(NSImage *)img;
 - (void)sliderChanged:(NSSlider *)sender;
@@ -199,6 +216,8 @@ static int  _send_msg(int fd, uint8_t type, uint32_t seq,
 - (BOOL)_viewPoint:(NSPoint)pt toImageFx:(double *)fx fy:(double *)fy;
 /* --- Phase 2: 3D mode --- */
 - (void)set3DPayload:(NSData *)payload;
+/* --- Stage B: apply a GSP_MSG_3D_MESH/COLORS/VIEW/OVERLAY payload (main thread) --- */
+- (void)applyScene:(uint8_t)type payload:(NSData *)payload;
 @end
 
 
@@ -250,6 +269,10 @@ static int  _send_msg(int fd, uint8_t type, uint32_t seq,
         _is_3d       = 0;
         _3d_lock     = [[NSLock alloc] init];
         _3d_payload  = nil;
+        _scene       = NULL;
+        _scene_ids   = NULL;
+        _scene_w     = _scene_h = 0;
+        _hover_ok    = 0;
 
         /* Coordinate readout label (top-right corner, hidden until cursor enters) */
         _coord_label = [[NSTextField alloc] initWithFrame:NSMakeRect(0,0,180,20)];
@@ -285,6 +308,8 @@ static int  _send_msg(int fd, uint8_t type, uint32_t seq,
     [_coord_label release];
     [_3d_lock release];
     [_3d_payload release];
+    gsp_scene3d_free(_scene);
+    free(_scene_ids);
     [super dealloc];
 }
 
@@ -348,6 +373,31 @@ static int  _send_msg(int fd, uint8_t type, uint32_t seq,
     [self setNeedsDisplay:YES];
 }
 
+/* --- Stage B ---
+ * Called on the main thread (from the connection thread's dispatch_async)
+ * with a GSP_MSG_3D_MESH/COLORS/VIEW/OVERLAY payload. The first one makes
+ * this a stage B view: drawRect: draws _scene from then on. */
+- (void)applyScene:(uint8_t)type payload:(NSData *)payload
+{
+    if (!_scene) _scene = gsp_scene3d_new();
+    if (!_scene) return;
+    const void *b = [payload bytes];
+    size_t      n = (size_t)[payload length];
+    int rc = 0;
+    switch (type) {
+    case GSP_MSG_3D_MESH:    rc = gsp_scene3d_set_mesh(_scene, b, n);    break;
+    case GSP_MSG_3D_COLORS:  rc = gsp_scene3d_set_colors(_scene, b, n);  break;
+    case GSP_MSG_3D_VIEW:    rc = gsp_scene3d_set_view(_scene, b, n);    break;
+    case GSP_MSG_3D_OVERLAY: rc = gsp_scene3d_set_overlay(_scene, b, n); break;
+    default: break;
+    }
+    if (rc < 0)
+        fprintf(stderr, "giza_server: malformed 3D message 0x%02X (%zu bytes) ignored\n", type, n);
+    _is_3d    = 1;
+    _hover_ok = 0;
+    [self setNeedsDisplay:YES];
+}
+
 /* ---- coordinate helpers ------------------------------------------- */
 
 /* Return the destination NSRect where the image is drawn (bottom-left
@@ -401,7 +451,8 @@ static int  _send_msg(int fd, uint8_t type, uint32_t seq,
      * Checked first and returns early so the 2D NSImage path below
      * never runs for a 3D window. */
     if (_is_3d) {
-        [self _draw3DFrame];
+        if (_scene) [self _drawScene];     /* stage B */
+        else        [self _draw3DFrame];
         /* opt-in timing: the frame is drawn; send its owed ACK, if any */
         if (gsp_tlog || gsp_ack_after) _gsp_page_drawn(self);
         return;
@@ -562,6 +613,156 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
  * UNCONFIRMED (flag for visual check once a 3D client is running):
  * whether this flip direction actually matches what looks "upright" -
  * if labels/axes appear upside-down, this is the first place to check. */
+/* --- Stage B: the overlay's drawing commands (gsp_scene3d_overlay_draw), in
+ * window pixels with y down, drawn as _draw3DFrame draws 3D_FRAME lines,
+ * points and labels: 1 px strokes, filled bands, filled circles, system
+ * font 11 placed with drawAtPoint: at (x, view_h - y). */
+- (void)_drawOverlay:(const gsp_ovl_draw_t *)d context:(CGContextRef)ctx viewHeight:(float)view_h
+{
+    for (size_t i = 0; i < d->nseg; i++) {
+        const gsp_ovl_seg_t *s = &d->seg[i];
+        if (s->band) {
+            float xl = s->x0 < s->x1 ? s->x0 : s->x1, bw = fabsf(s->x1 - s->x0);
+            float bh = s->width < 1.0f ? 1.0f : s->width;
+            if (bw < 1.0f) bw = 1.0f;
+            CGContextSetRGBFillColor(ctx, s->rgba[0] / 255.0f, s->rgba[1] / 255.0f,
+                                          s->rgba[2] / 255.0f, s->rgba[3] / 255.0f);
+            CGContextFillRect(ctx, CGRectMake(xl, view_h - s->y0 - bh, bw, bh));
+        } else {
+            CGContextSetRGBStrokeColor(ctx, s->rgba[0] / 255.0f, s->rgba[1] / 255.0f,
+                                            s->rgba[2] / 255.0f, s->rgba[3] / 255.0f);
+            CGContextSetLineWidth(ctx, s->width);
+            CGContextMoveToPoint(ctx, s->x0, view_h - s->y0);
+            CGContextAddLineToPoint(ctx, s->x1, view_h - s->y1);
+            CGContextStrokePath(ctx);
+        }
+    }
+    for (size_t i = 0; i < d->ndisc; i++) {
+        const gsp_ovl_disc_t *p = &d->disc[i];
+        float r = p->r < 1.0f ? 1.0f : p->r;
+        CGContextSetRGBFillColor(ctx, p->rgba[0] / 255.0f, p->rgba[1] / 255.0f,
+                                      p->rgba[2] / 255.0f, p->rgba[3] / 255.0f);
+        CGContextFillEllipseInRect(ctx, CGRectMake(p->x - r, view_h - p->y - r, 2 * r, 2 * r));
+    }
+    for (size_t i = 0; i < d->ntext; i++) {
+        const gsp_ovl_text_t *t = &d->text[i];
+        NSString *text = [NSString stringWithUTF8String:t->text];   /* the core checked the UTF-8 */
+        if (!text) continue;
+        NSDictionary *attrs = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:11],
+            NSForegroundColorAttributeName:
+                [NSColor colorWithCalibratedRed:t->rgb[0] / 255.0f green:t->rgb[1] / 255.0f
+                                           blue:t->rgb[2] / 255.0f alpha:1.0f],
+        };
+        [text drawAtPoint:NSMakePoint(t->x, view_h - t->y) withAttributes:attrs];
+    }
+}
+
+/* --- Stage B: draw _scene with the shared core into an RGBA buffer the size
+ * of the view (in points, as _draw3DFrame does), keep its id buffer for pick
+ * and hover, paint it, then the overlay hidden by this frame's z-buffer.
+ * The core's row 0 is the top of the picture and a CGImage is drawn upright
+ * in this y-up view, so no flip (the 3D_FRAME rasteriser writes rows
+ * bottom-up and flips the CTM). */
+- (void)_drawScene
+{
+    NSRect bounds = self.bounds;
+    float view_h  = (float)bounds.size.height;
+    int   w = (int)bounds.size.width, h = (int)bounds.size.height;
+    [[NSColor colorWithCalibratedRed:0.08 green:0.08 blue:0.12 alpha:1.0] setFill];
+    NSRectFill(bounds);
+    if (w <= 0 || h <= 0) return;
+    size_t npx = (size_t)w * h;
+    if (_scene_w != w || _scene_h != h) {
+        free(_scene_ids);
+        _scene_ids = malloc(npx * sizeof(uint32_t));
+        _scene_w = _scene_ids ? w : 0;
+        _scene_h = _scene_ids ? h : 0;
+    }
+    uint8_t *px = malloc(npx * 4);
+    float   *zb = malloc(npx * sizeof(float));
+    CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
+    if (px && zb && _scene_ids && gsp_scene3d_render(_scene, w, h, px, zb, _scene_ids) >= 0) {
+        CGColorSpaceRef   cs = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, npx * 4, NULL);
+        /* alpha is 0 (rgb 0) or 255, so premultiplied is exact */
+        CGImageRef img = CGImageCreate(w, h, 8, 32, (size_t)w * 4, cs,
+            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big,
+            dp, NULL, false, kCGRenderingIntentDefault);
+        if (img) {
+            CGContextDrawImage(ctx, CGRectMake(0, view_h - h, w, h), img);
+            CGImageRelease(img);
+        }
+        CGDataProviderRelease(dp);                 /* before free(px) */
+        CGColorSpaceRelease(cs);
+        gsp_ovl_draw_t od;
+        memset(&od, 0, sizeof od);
+        if (gsp_scene3d_overlay_draw(_scene, w, h, zb, &od) == 0)
+            [self _drawOverlay:&od context:ctx viewHeight:view_h];
+        gsp_ovl_draw_free(&od);
+    }
+    free(px);
+    free(zb);
+}
+
+/* --- Stage B input helpers (main thread) --- */
+
+/* Apply one input record to the scene; repaint and report the pose if it
+ * changed, pass other keys on to the client (gsp_scene3d_input). */
+- (void)_sceneInputDx:(float)dx dy:(float)dy dzoom:(float)dz type:(uint8_t)type key:(uint8_t)key
+{
+    gsp_3d_input_t in;
+    memset(&in, 0, sizeof in);
+    in.dx = dx; in.dy = dy; in.dzoom = dz; in.type = type; in.key = key;
+    int r = gsp_scene3d_input(_scene, &in);
+    if (r & GSP_SCENE3D_POSE_CHANGED) {
+        [self setNeedsDisplay:YES];
+        _3d_pose_send(self->win_id, &_scene->view);
+    }
+    if (r & GSP_SCENE3D_FORWARD)
+        _3d_input_send(self->win_id, dx, dy, dz, type, key);
+}
+
+/* The vertex under view point pt in the last frame's id buffer. Returns 0
+ * and sets *mi and *v, or -1. Buffer row 0 is the top of the view. */
+- (int)_sceneVertexAt:(NSPoint)pt mesh:(uint8_t *)mi vertex:(uint32_t *)v
+{
+    if (!_scene || !_scene_ids) return -1;
+    NSRect b = self.bounds;
+    int x = (int)floor(pt.x - b.origin.x);
+    int y = (int)floor(b.size.height - (pt.y - b.origin.y));
+    return gsp_scene3d_pick(_scene, _scene_ids, _scene_w, _scene_h, x, y, mi, v);
+}
+
+/* A click at view point pt: GSP_MSG_3D_PICKV with the vertex under it (or
+ * none) and the position as a fraction of the full view (y down). */
+- (void)_scenePickAt:(NSPoint)pt button:(uint8_t)btn
+{
+    NSRect b = self.bounds;
+    if (b.size.width <= 0 || b.size.height <= 0) return;
+    float fx = (float)((pt.x - b.origin.x) / b.size.width);
+    float fy = (float)(1.0 - (pt.y - b.origin.y) / b.size.height);
+    if (fx < 0.0f || fx > 1.0f || fy < 0.0f || fy > 1.0f) return;
+    uint8_t mi = 0; uint32_t v = GSP_SCENE3D_NO_ID;
+    if ([self _sceneVertexAt:pt mesh:&mi vertex:&v] < 0) v = GSP_SCENE3D_NO_ID;
+    _3d_vertex_send(self->win_id, GSP_MSG_3D_PICKV, mi, v, btn, fx, fy);
+}
+
+/* The pointer at view point pt: GSP_MSG_3D_HOVERV when the vertex under it
+ * changed. */
+- (void)_sceneHoverAt:(NSPoint)pt
+{
+    NSRect b = self.bounds;
+    if (b.size.width <= 0 || b.size.height <= 0) return;
+    uint8_t mi = 0; uint32_t v = GSP_SCENE3D_NO_ID;
+    if ([self _sceneVertexAt:pt mesh:&mi vertex:&v] < 0) v = GSP_SCENE3D_NO_ID;
+    if (_hover_ok && v == _hover_v && mi == _hover_m) return;
+    _hover_ok = 1; _hover_v = v; _hover_m = mi;
+    _3d_vertex_send(self->win_id, GSP_MSG_3D_HOVERV, mi, v, 0,
+                    (float)((pt.x - b.origin.x) / b.size.width),
+                    (float)(1.0 - (pt.y - b.origin.y) / b.size.height));
+}
+
 - (void)_draw3DFrame
 {
     [_3d_lock lock];
@@ -760,8 +961,10 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
      *  される。)手触りが合わなければこの係数が調整ノブ。 */
     if (_is_3d) {
         float dz = (float)(event.magnification * 10.0);
-        if (fabsf(dz) > 0.0f)
-            _3d_input_send(self->win_id, 0.0f, 0.0f, dz, /*type=wheel*/1, /*key*/0);
+        if (fabsf(dz) > 0.0f) {
+            if (_scene) [self _sceneInputDx:0 dy:0 dzoom:dz type:1 key:0];   /* stage B: here */
+            else _3d_input_send(self->win_id, 0.0f, 0.0f, dz, /*type=wheel*/1, /*key*/0);
+        }
         return;                    /* 2D の _zoom/_pan には触れない */
     }
 
@@ -787,8 +990,10 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
      * して送る(1ノッチ ≒ 5%)。手触りの調整ノブはここ。 */
     if (_is_3d) {
         float dz = (float)(event.scrollingDeltaY * 0.5);
-        if (fabsf(dz) > 0.0f)
-            _3d_input_send(self->win_id, 0.0f, 0.0f, dz, /*type=wheel*/1, /*key*/0);
+        if (fabsf(dz) > 0.0f) {
+            if (_scene) [self _sceneInputDx:0 dy:0 dzoom:dz type:1 key:0];   /* stage B: here */
+            else _3d_input_send(self->win_id, 0.0f, 0.0f, dz, /*type=wheel*/1, /*key*/0);
+        }
         return;                    /* 2D の _zoom/_pan には触れない */
     }
 
@@ -890,7 +1095,11 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
         NSPoint cur = [self convertPoint:[event locationInWindow] fromView:nil];
         float dx = (float)(cur.x - _rot_drag_start.x);
         float dy = (float)(cur.y - _rot_drag_start.y);
-        _3d_input_send(self->win_id, dx, dy, 0.0f, /*type=drag*/0, /*key*/0);
+        if (_scene) {                               /* stage B: rotate here, report the pose */
+            if (dx != 0.0f || dy != 0.0f) [self _sceneInputDx:dx dy:dy dzoom:0 type:0 key:0];
+        } else {
+            _3d_input_send(self->win_id, dx, dy, 0.0f, /*type=drag*/0, /*key*/0);
+        }
         _rot_drag_start = cur;
         return;
     }
@@ -932,6 +1141,11 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
         NSPoint up = [self convertPoint:[event locationInWindow] fromView:nil];
         double mdx = up.x - _3d_down_point.x;
         double mdy = up.y - _3d_down_point.y;
+        if (_scene) {                            /* stage B: the vertex from the id buffer */
+            if (mdx*mdx + mdy*mdy <= 9.0)
+                [self _scenePickAt:up button:(uint8_t)([event buttonNumber] + 1)];
+            return;
+        }
         if (mdx*mdx + mdy*mdy <= 9.0) {          /* < 3px travel = click */
             NSRect b = [self bounds];
             if (b.size.width > 0 && b.size.height > 0) {
@@ -971,6 +1185,11 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
         NSPoint up = [self convertPoint:[event locationInWindow] fromView:nil];
         double mdx = up.x - _3d_down_point.x;
         double mdy = up.y - _3d_down_point.y;
+        if (_scene) {                            /* stage B: PICKV, button 2 */
+            if (mdx*mdx + mdy*mdy <= 9.0)
+                [self _scenePickAt:up button:(uint8_t)([event buttonNumber] + 1)];
+            return;
+        }
         if (mdx*mdx + mdy*mdy <= 9.0) {          /* < 3px travel = click */
             NSRect b = [self bounds];
             if (b.size.width > 0 && b.size.height > 0) {
@@ -996,6 +1215,11 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
      * frame's full-bounds coords). Driver::GS3D turns this into a live
      * readout (MNI x,y,z + cortical area) on the Perl side, so hide the
      * server's own 2D fx/fy label here. --- */
+    if (_is_3d && _scene) {                      /* stage B: HOVERV when the vertex changes */
+        [self _sceneHoverAt:pt];
+        [_coord_label setHidden:YES];
+        return;
+    }
     if (_is_3d) {
         NSRect b = [self bounds];
         if (b.size.width > 0 && b.size.height > 0) {
@@ -1048,13 +1272,15 @@ static void _raster_and_blit(CGContextRef ctx, const void *tri_src, int n,
     if ([chars length] == 0) { [super keyDown:event]; return; }
     unichar c = [chars characterAtIndex:0];
 
-    /* Only 'p'/'P' (toggle perspective) and 'r'/'R' (reset view) are
-     * meaningful to Driver::GS3D::run() (see its type==2 branch), so
-     * only those are forwarded - anything else falls through to the
-     * default responder-chain handling rather than being silently sent
-     * as a no-op 3D_INPUT. */
-    if (c == 'p' || c == 'P' || c == 'r' || c == 'R') {
-        _3d_input_send(self->win_id, 0.0f, 0.0f, 0.0f, /*type=key*/2, (uint8_t)c);
+    /* Forward every printable ASCII key without Command, as the Xlib viewer
+     * forwards every key: the client decides what a key means
+     * (Driver::GS3D::run: 'p' perspective, 'r' reset, 'c' clear the seeds,
+     * 'u' undo the last seed). Until 2026-11-27 only p/P/r/R were sent, so
+     * 'c' and 'u' never reached the client on macOS. Command shortcuts and
+     * other keys go to the responder chain as before. */
+    if (c >= 0x20 && c < 0x7F && !([event modifierFlags] & NSEventModifierFlagCommand)) {
+        if (_scene) [self _sceneInputDx:0 dy:0 dzoom:0 type:2 key:(uint8_t)c];  /* stage B: p/r here, others forwarded */
+        else _3d_input_send(self->win_id, 0.0f, 0.0f, 0.0f, /*type=key*/2, (uint8_t)c);
         return;
     }
     [super keyDown:event];
@@ -2257,6 +2483,48 @@ static void _3d_input_send(int win_id, float dx, float dy, float dzoom,
     pthread_mutex_unlock(&w->write_lock);
 }
 
+/* Stage B: the pose after a local drag/wheel/pinch/'p'/'r' (GSP_MSG_3D_POSE,
+ * no ACK). Main thread. */
+static void _3d_pose_send(int win_id, const gsp_3d_view_t *view)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive || w->client_fd < 0) return;
+    pthread_mutex_lock(&w->write_lock);
+    if (w->client_fd >= 0)
+        _send_msg(w->client_fd, GSP_MSG_3D_POSE, w->seq_out++, view, sizeof *view);
+    pthread_mutex_unlock(&w->write_lock);
+}
+
+/* Stage B: the vertex under a click (GSP_MSG_3D_PICKV, 14 bytes) or under
+ * the pointer (GSP_MSG_3D_HOVERV: the same without the button, 13 bytes).
+ * Main thread. */
+static void _3d_vertex_send(int win_id, uint8_t type, uint8_t mesh_id, uint32_t vertex,
+                            uint8_t button, float fx, float fy)
+{
+    if (win_id < 0 || win_id >= GS.n_wins) return;
+    GsWindow *w = &GS.wins[win_id];
+    if (!w->alive || w->client_fd < 0) return;
+    uint8_t buf[sizeof(gsp_3d_pickv_t)];
+    uint32_t n;
+    if (type == GSP_MSG_3D_PICKV) {
+        gsp_3d_pickv_t rec;
+        rec.mesh_id = mesh_id; rec.vertex = vertex; rec.button = button; rec.fx = fx; rec.fy = fy;
+        memcpy(buf, &rec, sizeof rec);
+        n = (uint32_t)sizeof rec;
+    } else {
+        buf[0] = mesh_id;
+        memcpy(buf + 1, &vertex, 4);
+        memcpy(buf + 5, &fx, 4);
+        memcpy(buf + 9, &fy, 4);
+        n = 13;
+    }
+    pthread_mutex_lock(&w->write_lock);
+    if (w->client_fd >= 0)
+        _send_msg(w->client_fd, type, w->seq_out++, buf, n);
+    pthread_mutex_unlock(&w->write_lock);
+}
+
 /* Handle GSP_MSG_SAVEDATA from a client: find the window on this fd that
  * has a pending save (save_path set by the main thread in _vectorSave:)
  * and write the vector bytes to it.  Called from the per-connection
@@ -2368,9 +2636,45 @@ static void *_handle_connection(void *arg)
 
         switch (hdr.type) {
 
-        case GSP_MSG_PING:
-            _send_msg_locked(current_win, fd, GSP_MSG_PONG, seq_out++, NULL, 0);
+        case GSP_MSG_PING: {
+            /* A PING with a u32 payload of 1 asks for the capabilities:
+             * answer with the mask (stage B). A bare PING gets a bare PONG. */
+            uint32_t ask = 0;
+            if (payload && hdr.length == 4) memcpy(&ask, payload, 4);
+            if (ask == 1) {
+                uint32_t caps = GSP_CAP_3D_SCENE;
+                _send_msg_locked(current_win, fd, GSP_MSG_PONG, seq_out++, &caps, 4);
+            } else {
+                _send_msg_locked(current_win, fd, GSP_MSG_PONG, seq_out++, NULL, 0);
+            }
             break;
+        }
+
+        /* Stage B: hand the payload to the window's view on the main thread
+         * (it owns the scene). MESH, COLORS and OVERLAY are ACKed on
+         * receipt, VIEW is not. Without a window the payload is dropped,
+         * but the ACK still goes out so the client does not hang. */
+        case GSP_MSG_3D_MESH:
+        case GSP_MSG_3D_COLORS:
+        case GSP_MSG_3D_VIEW:
+        case GSP_MSG_3D_OVERLAY: {
+            uint8_t t = hdr.type;
+            if (current_win >= 0 && GS.wins[current_win].alive) {
+                GsWindow *wptr = &GS.wins[current_win];
+                GsView   *view = wptr->view;
+                wptr->is_3d = 1;
+                NSData *data = [[NSData alloc] initWithBytes:(payload ? payload : "")
+                                                      length:hdr.length];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (wptr->alive && wptr->view == view)   /* not closed meanwhile */
+                        [view applyScene:t payload:data];
+                    [data release];
+                });
+            }
+            if (t != GSP_MSG_3D_VIEW)
+                _send_msg_locked(current_win, fd, GSP_MSG_ACK, seq_out++, NULL, 0);
+            break;
+        }
 
         case GSP_MSG_NEWWIN: {
             gsp_newwin_t nw = {0, 0};

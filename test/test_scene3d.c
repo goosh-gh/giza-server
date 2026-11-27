@@ -61,6 +61,44 @@ static int add_tri(gsp_scene3d_t *sc, uint8_t id, uint8_t flags, float dx, float
     return rc;
 }
 
+/* A GSP_MSG_3D_OVERLAY payload, built in order: ovl_new (depth_eps and the
+ * point count), points, ovl_next (opens the line count), lines, ovl_next
+ * (opens the label count), labels. Each item updates the open count. */
+typedef struct { uint8_t *b; size_t n, cap, count_at; uint32_t count; } ovl_t;
+static void ovl_put(ovl_t *o, const void *p, size_t n)
+{
+    if (o->n + n > o->cap) { o->cap = (o->n + n) * 2 + 64; o->b = realloc(o->b, o->cap); }
+    memcpy(o->b + o->n, p, n); o->n += n;
+}
+static ovl_t ovl_new(float eps)
+{
+    ovl_t o = { 0 };
+    uint32_t z = 0;
+    ovl_put(&o, &eps, 4); o.count_at = o.n; ovl_put(&o, &z, 4);
+    return o;
+}
+static void ovl_next(ovl_t *o)
+{
+    uint32_t z = 0; o->count = 0; o->count_at = o->n; ovl_put(o, &z, 4);
+}
+static void ovl_counted(ovl_t *o) { o->count++; memcpy(o->b + o->count_at, &o->count, 4); }
+static void ovl_point(ovl_t *o, float x, float y, float z, float r, uint8_t flags)
+{
+    gsp_3d_ovl_point_t p = { { x, y, z }, r, { 255, 255, 255, 255 }, flags };
+    ovl_put(o, &p, sizeof p); ovl_counted(o);
+}
+static void ovl_line(ovl_t *o, float x0, float y0, float z0, float x1, float y1, float z1,
+                     float w, uint8_t flags)
+{
+    gsp_3d_ovl_line_t l = { { x0, y0, z0 }, { x1, y1, z1 }, w, { 255, 80, 80, 255 }, flags };
+    ovl_put(o, &l, sizeof l); ovl_counted(o);
+}
+static void ovl_label(ovl_t *o, float x, float y, float z, float dx, float dy, uint8_t flags, const char *t)
+{
+    gsp_3d_ovl_label_t l = { { x, y, z }, dx, dy, { 255, 255, 200 }, flags, (uint8_t)strlen(t) };
+    ovl_put(o, &l, sizeof l); ovl_put(o, t, strlen(t)); ovl_counted(o);
+}
+
 static int near_u8(int got, int want) { return abs(got - want) <= 1; }
 #define PIX(x, y) (px + ((size_t)(y) * W + (x)) * 4)
 
@@ -224,6 +262,96 @@ int main(void)
         CHECK(bad_mask == 0, "every drag, wheel, 'p' and 'r' reports a pose change");
         gsp_3d_input_t key_c = { 0, 0, 0, 2, 'c' };
         CHECK(gsp_scene3d_input(sc, &key_c) == GSP_SCENE3D_FORWARD, "key 'c' is passed on to the client");
+        gsp_scene3d_free(sc);
+    }
+
+    /* ---- overlay (GSP_MSG_3D_OVERLAY): projected, hidden by the mesh ----
+     * The test triangle at z = 0 covers model x, y >= 0, x + y <= 10, which is
+     * screen (50 - x, 50 + y). Depth z > 0 is in front of it. */
+    {
+        gsp_scene3d_t *sc = gsp_scene3d_new();
+        set_view(sc, 1, 0, 0, 0, 1, 0);
+        add_tri(sc, 0, 0, 0, 0, 200, 100, 50, 1);
+        gsp_scene3d_render(sc, W, H, px, zb, ids);
+        ovl_t o = ovl_new(1.0f);
+        ovl_point(&o, 2, 2, 5, 4, 0);                       /* in front: drawn */
+        ovl_point(&o, 30, 30, -5, 4, 0);                    /* behind, but no mesh there: drawn */
+        ovl_point(&o, 2, 2, -5, 4, 0);                      /* behind the mesh: hidden */
+        ovl_point(&o, 3, 3, -5, 4, GSP_OVL_ON_TOP);         /* behind but on top: drawn */
+        ovl_point(&o, 1, 1, -0.5f, 4, 0);                   /* within depth_eps 1: drawn */
+        ovl_point(&o, 10, 20, 0, 3, GSP_OVL_SCREEN);        /* window pixels */
+        ovl_next(&o);
+        ovl_line(&o, -5, 2, -5, 15, 2, -5, 1, 0);           /* behind: cut at x 0..8 */
+        ovl_line(&o, -5, 4, -5, 15, 4, -5, 1, GSP_OVL_ON_TOP);
+        ovl_line(&o, 0, 0, 0, 20, 0, 0, 1, GSP_OVL_ON_TOP | GSP_OVL_ARROW);
+        ovl_line(&o, 10, 30, 0, 20, 30, 0, 2, GSP_OVL_SCREEN | GSP_OVL_BAND);
+        ovl_next(&o);
+        ovl_label(&o, 2, 2, 5, 6, -6, 0, "Cz");             /* at (48,52) + (6,-6) */
+        ovl_label(&o, 2, 2, -5, 6, -6, 0, "hidden");
+        ovl_label(&o, 12, 20, 0, 0, 0, GSP_OVL_SCREEN, "\xE9\x9B\xBB\xE6\xA5\xB5");  /* "電極" */
+        ovl_label(&o, 12, 40, 0, 0, 0, GSP_OVL_SCREEN, "bad\xFF");
+        ovl_label(&o, 12, 60, 0, 0, 0, GSP_OVL_SCREEN, "\xED\xA0\x80");             /* a surrogate */
+        CHECK(gsp_scene3d_set_overlay(sc, o.b, o.n) == 0, "overlay accepted (%zu bytes)", o.n);
+        gsp_ovl_draw_t d;
+        memset(&d, 0, sizeof d);
+        CHECK(gsp_scene3d_overlay_draw(sc, W, H, zb, &d) == 0, "overlay drawn");
+        CHECK(d.ndisc == 5, "5 of 6 points drawn (got %zu)", d.ndisc);
+        /* 3D far to near: (30,30,-5) and (3,3,-5) [same depth: by order], (1,1,-0.5), (2,2,5); then the screen one */
+        CHECK(d.ndisc == 5 && d.disc[0].x == 20 && d.disc[0].y == 80 && d.disc[1].x == 47
+              && d.disc[2].x == 49 && d.disc[3].x == 48 && d.disc[3].y == 52 && d.disc[3].r == 4,
+              "points far to near: (%g,%g) (%g) (%g) (%g,%g r %g)", d.disc[0].x, d.disc[0].y,
+              d.disc[1].x, d.disc[2].x, d.disc[3].x, d.disc[3].y, d.disc[3].r);
+        CHECK(d.ndisc == 5 && d.disc[4].x == 10 && d.disc[4].y == 20 && d.disc[4].r == 3,
+              "screen point last, at (10,20) r 3");
+        /* line 1: screen x 55 -> 35 at y 52; hidden where the triangle covers x 0..8 (screen 50..42) */
+        CHECK(d.nseg == 2 + 1 + 3 + 1, "segments: 2 pieces of the hidden line, 1 on top, 1 + 2 arrow, 1 band (got %zu)", d.nseg);
+        CHECK(d.nseg >= 2 && fabs(d.seg[0].x0 - 55) < 0.01 && fabs(d.seg[0].x1 - 50) < 1.5
+              && fabs(d.seg[1].x0 - 42) < 1.5 && fabs(d.seg[1].x1 - 35) < 0.01 && d.seg[0].y0 == 52,
+              "hidden line cut: %g..%g and %g..%g", d.seg[0].x0, d.seg[0].x1, d.seg[1].x0, d.seg[1].x1);
+        CHECK(d.nseg >= 3 && d.seg[2].x0 == 55 && d.seg[2].x1 == 35 && !d.seg[2].band, "on-top line whole");
+        CHECK(d.nseg >= 6 && d.seg[3].x0 == 50 && d.seg[3].x1 == 30
+              && fabs(d.seg[4].x1 - 42) < 1e-4 && fabs(d.seg[4].y1 - 45) < 1e-4
+              && fabs(d.seg[5].x1 - 42) < 1e-4 && fabs(d.seg[5].y1 - 55) < 1e-4,
+              "arrow head at (30,50): wings to (42,45) and (42,55)");
+        CHECK(d.nseg == 7 && d.seg[6].band && d.seg[6].x0 == 10 && d.seg[6].x1 == 20
+              && d.seg[6].y0 == 30 && d.seg[6].width == 2, "band in window pixels");
+        CHECK(d.ntext == 2, "labels: 2 drawn (not the hidden one, not the bad UTF-8 ones) (got %zu)", d.ntext);
+        CHECK(d.ntext >= 1 && d.text[0].x == 54 && d.text[0].y == 46 && strcmp(d.text[0].text, "Cz") == 0,
+              "label at its point plus (6,-6)");
+        CHECK(d.ntext >= 2 && strcmp(d.text[1].text, "\xE9\x9B\xBB\xE6\xA5\xB5") == 0
+              && d.text[1].x == 12 && d.text[1].y == 20, "UTF-8 label in window pixels");
+
+        /* zoom 2 doubles a 3D point's radius, not a screen point's */
+        set_view(sc, 1, 0, 0, 0, 2, 0);
+        gsp_scene3d_overlay_draw(sc, W, H, NULL, &d);
+        CHECK(d.ndisc == 6 && d.disc[5].r == 3 && d.disc[4].r == 8, "zoom 2: radius 8 for 3D, 3 for screen");
+        CHECK(d.nseg == 1 + 1 + 3 + 1, "zb NULL: nothing hidden (got %zu segments)", d.nseg);
+
+        /* malformed overlays change nothing */
+        CHECK(gsp_scene3d_set_overlay(sc, o.b, o.n - 1) == -1, "truncated overlay refused");
+        uint8_t *x = malloc(o.n + 1); memcpy(x, o.b, o.n); x[o.n] = 0;
+        CHECK(gsp_scene3d_set_overlay(sc, x, o.n + 1) == -1, "a byte too many refused");
+        free(x);
+        CHECK(sc->ovl.np == 6 && sc->ovl.nl == 4 && sc->ovl.nt == 5, "the earlier overlay is kept");
+        ovl_t e = ovl_new(1.0f); ovl_next(&e); ovl_next(&e);
+        CHECK(gsp_scene3d_set_overlay(sc, e.b, e.n) == 0, "empty overlay accepted");
+        gsp_scene3d_overlay_draw(sc, W, H, zb, &d);
+        CHECK(d.nseg == 0 && d.ndisc == 0 && d.ntext == 0, "empty overlay draws nothing");
+        ovl_t big = ovl_new(1.0f);
+        uint32_t huge = 0x10000000u; memcpy(big.b + 4, &huge, 4);
+        ovl_next(&big); ovl_next(&big);
+        CHECK(gsp_scene3d_set_overlay(sc, big.b, big.n) == -1, "a point count past the end refused");
+        /* perspective: a point behind the eye (z >= 800 at zoom 1) is not drawn */
+        set_view(sc, 1, 0, 0, 0, 1, 1);
+        ovl_t pe = ovl_new(1.0f);
+        ovl_point(&pe, 0, 0, 900, 4, GSP_OVL_ON_TOP);
+        ovl_point(&pe, 0, 0, 100, 4, GSP_OVL_ON_TOP);
+        ovl_next(&pe); ovl_next(&pe);
+        gsp_scene3d_set_overlay(sc, pe.b, pe.n);
+        gsp_scene3d_overlay_draw(sc, W, H, zb, &d);
+        CHECK(d.ndisc == 1, "perspective: the point behind the eye is skipped (got %zu)", d.ndisc);
+        free(o.b); free(e.b); free(big.b); free(pe.b);
+        gsp_ovl_draw_free(&d);
         gsp_scene3d_free(sc);
     }
 

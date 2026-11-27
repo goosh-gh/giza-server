@@ -250,4 +250,48 @@ typedef struct __attribute__((packed)) {
     float    fx, fy;      /* position as a fraction of the full view bounds */
 } gsp_3d_pickv_t;
 
+/* GSP_MSG_3D_OVERLAY payload: points, lines and labels drawn over the meshes
+ * (electrodes, axes, seeds, colour bar, readout). Each message replaces the
+ * whole overlay of the window.
+ *   float    depth_eps    a 3D item is hidden where a mesh is nearer than
+ *                         its depth minus depth_eps (model units)
+ *   uint32_t n_points,  gsp_3d_ovl_point_t[n_points]
+ *   uint32_t n_lines,   gsp_3d_ovl_line_t[n_lines]
+ *   uint32_t n_labels,  then per label: gsp_3d_ovl_label_t, char text[len]
+ *                       (UTF-8, not terminated; invalid UTF-8 draws nothing)
+ * Positions are model coordinates, projected with the view like the meshes,
+ * or with GSP_OVL_SCREEN window pixels (x right, y down from the top left;
+ * z ignored). A 3D point's radius is in pixels at zoom 1 and grows with the
+ * zoom; a screen point's does not; line widths are pixels. A 3D line is cut
+ * where the mesh hides it. A label is drawn at its position's screen point
+ * plus (dx, dy) pixels, as the start of the text's baseline (as a 3D_FRAME
+ * label), and is hidden when its position is. Lines are drawn first, then
+ * points (3D ones far to near, then screen ones), then labels. */
+#define GSP_OVL_SCREEN  0x01  /* window pixels, not projected */
+#define GSP_OVL_ON_TOP  0x02  /* never hidden by a mesh */
+#define GSP_OVL_ARROW   0x04  /* line: arrow head at p1 (12 px long, 5 px each side) */
+#define GSP_OVL_BAND    0x08  /* line: filled band x0..x1, y0..y0 + width (colour bar rows) */
+
+typedef struct __attribute__((packed)) {
+    float   pos[3];
+    float   radius;
+    uint8_t rgba[4];
+    uint8_t flags;
+} gsp_3d_ovl_point_t;     /* 21 bytes */
+
+typedef struct __attribute__((packed)) {
+    float   p0[3], p1[3];
+    float   width;
+    uint8_t rgba[4];
+    uint8_t flags;
+} gsp_3d_ovl_line_t;      /* 33 bytes */
+
+typedef struct __attribute__((packed)) {
+    float   pos[3];
+    float   dx, dy;
+    uint8_t rgb[3];
+    uint8_t flags;
+    uint8_t len;          /* text bytes that follow */
+} gsp_3d_ovl_label_t;     /* 25 bytes + len */
+
 #endif /* GSP_3D_H */

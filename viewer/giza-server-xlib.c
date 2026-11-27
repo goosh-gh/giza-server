@@ -42,6 +42,7 @@ extern void gsp3d_draw_cairo(cairo_t *cr, double ox, double oy,
 
 #include <png.h>
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -625,13 +626,61 @@ _tabbar_hit(GsContainer *c, const int *tabs, int n, int ex, int ey,
     return tabs[i];
 }
 
+/* Stage B: paint the overlay's drawing commands (gsp_scene3d_overlay_draw)
+ * at (bx, by), as a 3D_FRAME tab paints its lines, points and labels
+ * (giza-server-xlib-3d.c): strokes, filled bands, filled circles, sans 11. */
+static void
+_draw_overlay(cairo_t *cr, const gsp_ovl_draw_t *d, int bx, int by, int bw, int bh)
+{
+    cairo_save(cr);
+    cairo_rectangle(cr, bx, by, bw, bh);
+    cairo_clip(cr);
+    cairo_translate(cr, bx, by);
+    for (size_t i = 0; i < d->nseg; i++) {
+        const gsp_ovl_seg_t *s = &d->seg[i];
+        cairo_set_source_rgba(cr, s->rgba[0] / 255.0, s->rgba[1] / 255.0,
+                                  s->rgba[2] / 255.0, s->rgba[3] / 255.0);
+        if (s->band) {
+            double xl = s->x0 < s->x1 ? s->x0 : s->x1, bwid = fabs(s->x1 - s->x0);
+            cairo_rectangle(cr, xl, s->y0, bwid < 1 ? 1 : bwid, s->width < 1 ? 1 : s->width);
+            cairo_fill(cr);
+        } else {
+            cairo_set_line_width(cr, s->width);
+            cairo_move_to(cr, s->x0, s->y0);
+            cairo_line_to(cr, s->x1, s->y1);
+            cairo_stroke(cr);
+        }
+    }
+    for (size_t i = 0; i < d->ndisc; i++) {
+        const gsp_ovl_disc_t *p = &d->disc[i];
+        cairo_set_source_rgba(cr, p->rgba[0] / 255.0, p->rgba[1] / 255.0,
+                                  p->rgba[2] / 255.0, p->rgba[3] / 255.0);
+        cairo_new_sub_path(cr);
+        cairo_arc(cr, p->x, p->y, p->r < 1 ? 1 : p->r, 0, 2 * M_PI);
+        cairo_fill(cr);
+    }
+    cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr, 11.0);
+    for (size_t i = 0; i < d->ntext; i++) {
+        const gsp_ovl_text_t *t = &d->text[i];
+        cairo_set_source_rgb(cr, t->rgb[0] / 255.0, t->rgb[1] / 255.0, t->rgb[2] / 255.0);
+        cairo_move_to(cr, t->x, t->y);
+        cairo_show_text(cr, t->text);
+    }
+    cairo_restore(cr);
+}
+
 /* Stage B: draw the tab's scene into a bw x bh RGBA buffer with the shared
  * core (gsp_scene3d.c), keep its id buffer for pick/hover, and paint it at
- * (bx, by). Transparent pixels (nothing drawn) show the white background. */
+ * (bx, by). Transparent pixels (nothing drawn) show the background, the same
+ * dark colour as a 3D_FRAME tab (giza-server-xlib-3d.c). */
 static void
 _draw_scene(cairo_t *cr, GsWindow *win, int bx, int by, int bw, int bh)
 {
     if (bw <= 0 || bh <= 0) return;
+    cairo_set_source_rgb(cr, 0.08, 0.08, 0.12);
+    cairo_rectangle(cr, bx, by, bw, bh);
+    cairo_fill(cr);
     size_t npx = (size_t)bw * bh;
     uint8_t *px = malloc(npx * 4);
     float   *zb = malloc(npx * sizeof(float));
@@ -659,6 +708,12 @@ _draw_scene(cairo_t *cr, GsWindow *win, int bx, int by, int bw, int bh)
             cairo_paint(cr);
         }
         cairo_surface_destroy(img);
+        /* The overlay, hidden where the meshes are nearer (zb of this frame). */
+        gsp_ovl_draw_t od;
+        memset(&od, 0, sizeof od);
+        if (gsp_scene3d_overlay_draw(win->scene, bw, bh, zb, &od) == 0)
+            _draw_overlay(cr, &od, bx, by, bw, bh);
+        gsp_ovl_draw_free(&od);
     }
     free(px);
     free(zb);
@@ -905,7 +960,8 @@ _dispatch(Cmd *cmd)
                 case GSP_MSG_3D_MESH:   rc = gsp_scene3d_set_mesh(w3->scene, cmd->p3d, cmd->p3d_len); break;
                 case GSP_MSG_3D_COLORS: rc = gsp_scene3d_set_colors(w3->scene, cmd->p3d, cmd->p3d_len); break;
                 case GSP_MSG_3D_VIEW:   rc = gsp_scene3d_set_view(w3->scene, cmd->p3d, cmd->p3d_len); break;
-                default: break;        /* GSP_MSG_3D_OVERLAY: accepted, not drawn yet */
+                case GSP_MSG_3D_OVERLAY: rc = gsp_scene3d_set_overlay(w3->scene, cmd->p3d, cmd->p3d_len); break;
+                default: break;
                 }
                 if (rc < 0)
                     fprintf(stderr, "giza_server: malformed 3D message 0x%02X (%zu bytes) ignored\n",

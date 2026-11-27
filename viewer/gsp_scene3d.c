@@ -34,10 +34,17 @@ static void mesh_clear(gsp_mesh3d_t *m)
     memset(m, 0, sizeof *m);
 }
 
+static void overlay_clear(gsp_overlay3d_t *o)
+{
+    free(o->pts); free(o->lines); free(o->labels); free(o->text);
+    memset(o, 0, sizeof *o);
+}
+
 void gsp_scene3d_free(gsp_scene3d_t *sc)
 {
     if (!sc) return;
     for (int i = 0; i < GSP_SCENE3D_MAX_MESH; i++) mesh_clear(&sc->mesh[i]);
+    overlay_clear(&sc->ovl);
     free(sc->tris); free(sc->tri_id);
     free(sc);
 }
@@ -318,4 +325,285 @@ int gsp_scene3d_pick(const gsp_scene3d_t *sc, const uint32_t *ids, int w, int h,
     *mesh_id = mi;
     *vertex = bv;
     return 0;
+}
+
+/* ------------------------------------------------------------------
+ * Overlay (GSP_MSG_3D_OVERLAY): points, lines and labels over the meshes.
+ * ------------------------------------------------------------------ */
+
+/* 1 if s[0..n) is well-formed UTF-8 (no overlongs, surrogates or > U+10FFFF). */
+static int utf8_ok(const uint8_t *s, size_t n)
+{
+    size_t i = 0;
+    while (i < n) {
+        uint8_t c = s[i];
+        size_t k;
+        uint32_t cp;
+        if (c < 0x80) { i++; continue; }
+        else if ((c & 0xE0) == 0xC0) { k = 1; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { k = 2; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { k = 3; cp = c & 0x07; }
+        else return 0;
+        for (size_t j = 1; j <= k; j++) {
+            if (i + j >= n || (s[i + j] & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (s[i + j] & 0x3F);
+        }
+        if ((k == 1 && cp < 0x80) || (k == 2 && cp < 0x800) || (k == 3 && cp < 0x10000)) return 0;
+        if ((cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF) return 0;
+        i += k + 1;
+    }
+    return 1;
+}
+
+int gsp_scene3d_set_overlay(gsp_scene3d_t *sc, const void *payload, size_t len)
+{
+    const uint8_t *p = payload, *end = p + len;
+    float eps;
+    uint32_t np, nl, nt;
+    if (len < 4 + 4) return -1;
+    memcpy(&eps, p, 4); p += 4;
+    if (!isfinite(eps)) return -1;
+    memcpy(&np, p, 4); p += 4;
+    if ((uint64_t)np * sizeof(gsp_3d_ovl_point_t) > (uint64_t)(end - p)) return -1;
+    const uint8_t *pp = p; p += (size_t)np * sizeof(gsp_3d_ovl_point_t);
+    if (end - p < 4) return -1;
+    memcpy(&nl, p, 4); p += 4;
+    if ((uint64_t)nl * sizeof(gsp_3d_ovl_line_t) > (uint64_t)(end - p)) return -1;
+    const uint8_t *pl = p; p += (size_t)nl * sizeof(gsp_3d_ovl_line_t);
+    if (end - p < 4) return -1;
+    memcpy(&nt, p, 4); p += 4;
+    if ((uint64_t)nt * sizeof(gsp_3d_ovl_label_t) > (uint64_t)(end - p)) return -1;
+    const uint8_t *pt = p;
+    size_t text_bytes = 0;                            /* walk the labels: lengths must add up */
+    for (uint32_t i = 0; i < nt; i++) {
+        if ((size_t)(end - p) < sizeof(gsp_3d_ovl_label_t)) return -1;
+        gsp_3d_ovl_label_t lb;
+        memcpy(&lb, p, sizeof lb);
+        p += sizeof lb;
+        if ((size_t)(end - p) < lb.len) return -1;
+        p += lb.len;
+        text_bytes += (size_t)lb.len + 1;
+    }
+    if (p != end) return -1;
+
+    gsp_overlay3d_t o;
+    memset(&o, 0, sizeof o);
+    o.eps = eps; o.np = np; o.nl = nl; o.nt = nt;
+    o.pts    = malloc((np ? np : 1) * sizeof *o.pts);
+    o.lines  = malloc((nl ? nl : 1) * sizeof *o.lines);
+    o.labels = malloc((nt ? nt : 1) * sizeof *o.labels);
+    o.text   = malloc(text_bytes ? text_bytes : 1);
+    if (!o.pts || !o.lines || !o.labels || !o.text) { overlay_clear(&o); return -1; }
+    for (uint32_t i = 0; i < np; i++) {
+        gsp_3d_ovl_point_t w;
+        memcpy(&w, pp + (size_t)i * sizeof w, sizeof w);
+        memcpy(o.pts[i].pos, w.pos, sizeof w.pos);
+        o.pts[i].radius = w.radius;
+        memcpy(o.pts[i].rgba, w.rgba, 4);
+        o.pts[i].flags = w.flags;
+    }
+    for (uint32_t i = 0; i < nl; i++) {
+        gsp_3d_ovl_line_t w;
+        memcpy(&w, pl + (size_t)i * sizeof w, sizeof w);
+        memcpy(o.lines[i].p0, w.p0, sizeof w.p0);
+        memcpy(o.lines[i].p1, w.p1, sizeof w.p1);
+        o.lines[i].width = w.width;
+        memcpy(o.lines[i].rgba, w.rgba, 4);
+        o.lines[i].flags = w.flags;
+    }
+    char *tp = o.text;
+    p = pt;
+    for (uint32_t i = 0; i < nt; i++) {
+        gsp_3d_ovl_label_t w;
+        memcpy(&w, p, sizeof w);
+        p += sizeof w;
+        memcpy(o.labels[i].pos, w.pos, sizeof w.pos);
+        o.labels[i].dx = w.dx; o.labels[i].dy = w.dy;
+        memcpy(o.labels[i].rgb, w.rgb, 3);
+        o.labels[i].flags = w.flags;
+        size_t n = utf8_ok(p, w.len) ? w.len : 0;  /* cairo and Cocoa reject bad UTF-8 */
+        memcpy(tp, p, n);
+        tp[n] = '\0';
+        o.labels[i].text = tp;
+        tp += (size_t)w.len + 1;
+        p += w.len;
+    }
+    overlay_clear(&sc->ovl);
+    sc->ovl = o;
+    return 0;
+}
+
+typedef struct {
+    double R[9], pv[3], zoom, cx, cy, fov;
+    int    persp, w, h;
+    const float *zb;
+    double eps;
+} ovl_ctx_t;
+
+/* Screen position and depth of an overlay position; 0 if it cannot be
+ * projected (behind the eye, or not finite). */
+static int ovl_project(const ovl_ctx_t *c, const float p[3], uint8_t flags,
+                       double *sx, double *sy, double *z)
+{
+    if (flags & GSP_OVL_SCREEN) {
+        *sx = p[0]; *sy = p[1]; *z = 0;
+        return isfinite(*sx) && isfinite(*sy);
+    }
+    double X = p[0] - c->pv[0], Y = p[1] - c->pv[1], Z = p[2] - c->pv[2];
+    double x = c->R[0]*X + c->R[1]*Y + c->R[2]*Z;
+    double y = c->R[3]*X + c->R[4]*Y + c->R[5]*Z;
+    double zz = c->R[6]*X + c->R[7]*Y + c->R[8]*Z;
+    if (c->persp) {
+        double d = c->fov - zz + 200;
+        if (!(d > 1e-6)) return 0;
+        double s = c->fov / d;
+        *sx = c->cx - x * s * c->zoom; *sy = y * s * c->zoom + c->cy;
+    } else {
+        *sx = c->cx - x * c->zoom;     *sy = y * c->zoom + c->cy;
+    }
+    *z = zz;
+    return isfinite(*sx) && isfinite(*sy) && isfinite(zz);
+}
+
+/* 1 if a projected item at (sx, sy) with depth z is not hidden by a mesh. */
+static int ovl_visible(const ovl_ctx_t *c, double sx, double sy, double z, uint8_t flags)
+{
+    if (!c->zb || (flags & (GSP_OVL_SCREEN | GSP_OVL_ON_TOP))) return 1;
+    if (sx < 0 || sy < 0 || sx >= c->w || sy >= c->h) return 1;
+    float m = c->zb[(size_t)(int)sy * c->w + (int)sx];
+    return !(m > z + c->eps);
+}
+
+#define GROW(arr, n, cap) do { if ((n) >= (cap)) {                          \
+        size_t nc_ = (cap) ? 2 * (cap) : 64;                                 \
+        void *t_ = realloc((arr), nc_ * sizeof *(arr));                      \
+        if (!t_) return -1;                                                  \
+        (arr) = t_; (cap) = nc_; } } while (0)
+
+static int add_seg(gsp_ovl_draw_t *d, double x0, double y0, double x1, double y1,
+                   double width, const uint8_t rgba[4], int band)
+{
+    GROW(d->seg, d->nseg, d->segcap);
+    gsp_ovl_seg_t *s = &d->seg[d->nseg++];
+    s->x0 = (float)x0; s->y0 = (float)y0; s->x1 = (float)x1; s->y1 = (float)y1;
+    s->width = (float)width; memcpy(s->rgba, rgba, 4); s->band = (uint8_t)band;
+    return 0;
+}
+
+typedef struct { uint32_t i; double z; } zidx_t;
+static int cmp_far_first(const void *a, const void *b)
+{
+    const zidx_t *x = a, *y = b;
+    if (x->z < y->z) return -1;
+    if (x->z > y->z) return 1;
+    return (x->i > y->i) - (x->i < y->i);
+}
+
+int gsp_scene3d_overlay_draw(const gsp_scene3d_t *sc, int w, int h, const float *zb,
+                             gsp_ovl_draw_t *d)
+{
+    d->nseg = d->ndisc = d->ntext = 0;
+    const gsp_overlay3d_t *o = &sc->ovl;
+    ovl_ctx_t c;
+    q_to_rot(sc->view.q[0], sc->view.q[1], sc->view.q[2], sc->view.q[3], c.R);
+    for (int j = 0; j < 3; j++) c.pv[j] = sc->view.pivot[j];
+    c.zoom = sc->view.zoom; c.cx = w / 2.0; c.cy = h / 2.0; c.fov = 600 * c.zoom;
+    c.persp = sc->view.perspective; c.w = w; c.h = h; c.zb = zb; c.eps = o->eps;
+
+    /* Lines: 3D ones are sampled every pixel and cut where the mesh hides them. */
+    for (uint32_t i = 0; i < o->nl; i++) {
+        const gsp_ovl_line_t *ln = &o->lines[i];
+        double x0, y0, z0, x1, y1, z1;
+        if (!ovl_project(&c, ln->p0, ln->flags, &x0, &y0, &z0) ||
+            !ovl_project(&c, ln->p1, ln->flags, &x1, &y1, &z1)) continue;
+        double lw = ln->width > 0 ? ln->width : 1;
+        if (ln->flags & GSP_OVL_BAND) {
+            if (add_seg(d, x0, y0, x1, y0, lw, ln->rgba, 1) < 0) return -1;
+            continue;
+        }
+        double L = hypot(x1 - x0, y1 - y0);
+        int n = (int)ceil(L);
+        if (n < 1) n = 1;
+        if (n > 8192) n = 8192;
+        int run = -1;
+        for (int k = 0; k <= n + 1; k++) {
+            int vis = 0;
+            if (k <= n) {
+                double t = (double)k / n;
+                vis = ovl_visible(&c, x0 + t * (x1 - x0), y0 + t * (y1 - y0),
+                                  z0 + t * (z1 - z0), ln->flags);
+            }
+            if (vis && run < 0) run = k;
+            if (!vis && run >= 0) {
+                double ta = run == 0 ? 0 : (run - 0.5) / n;
+                double tb = k - 1 == n ? 1 : (k - 0.5) / n;
+                if (add_seg(d, x0 + ta * (x1 - x0), y0 + ta * (y1 - y0),
+                               x0 + tb * (x1 - x0), y0 + tb * (y1 - y0), lw, ln->rgba, 0) < 0)
+                    return -1;
+                run = -1;
+            }
+        }
+        if ((ln->flags & GSP_OVL_ARROW) && L > 1e-9 && ovl_visible(&c, x1, y1, z1, ln->flags)) {
+            double ux = (x1 - x0) / L, uy = (y1 - y0) / L, px = -uy, py = ux;
+            double bx = x1 - ux * 12, by = y1 - uy * 12;
+            if (add_seg(d, x1, y1, bx + px * 5, by + py * 5, lw, ln->rgba, 0) < 0 ||
+                add_seg(d, x1, y1, bx - px * 5, by - py * 5, lw, ln->rgba, 0) < 0) return -1;
+        }
+    }
+
+    /* Points: 3D ones far to near, then screen ones in order. */
+    if (o->np) {
+        zidx_t *ord = malloc(o->np * sizeof *ord);
+        if (!ord) return -1;
+        uint32_t n3 = 0, ns = 0;
+        for (uint32_t i = 0; i < o->np; i++)
+            if (!(o->pts[i].flags & GSP_OVL_SCREEN)) {
+                double sx, sy, z;
+                ord[n3].i = i;
+                ord[n3].z = ovl_project(&c, o->pts[i].pos, o->pts[i].flags, &sx, &sy, &z) ? z : -1e30;
+                n3++;
+            }
+        qsort(ord, n3, sizeof *ord, cmp_far_first);
+        for (uint32_t i = 0; i < o->np; i++)
+            if (o->pts[i].flags & GSP_OVL_SCREEN) { ord[n3 + ns].i = i; ord[n3 + ns].z = 0; ns++; }
+        for (uint32_t k = 0; k < n3 + ns; k++) {
+            const gsp_ovl_point_t *pt = &o->pts[ord[k].i];
+            double sx, sy, z;
+            if (!ovl_project(&c, pt->pos, pt->flags, &sx, &sy, &z)) continue;
+            if (!ovl_visible(&c, sx, sy, z, pt->flags)) continue;
+            if (d->ndisc >= d->disccap) {
+                size_t nc = d->disccap ? 2 * d->disccap : 64;
+                void *t = realloc(d->disc, nc * sizeof *d->disc);
+                if (!t) { free(ord); return -1; }
+                d->disc = t; d->disccap = nc;
+            }
+            gsp_ovl_disc_t *ds = &d->disc[d->ndisc++];
+            ds->x = (float)sx; ds->y = (float)sy;
+            ds->r = (float)(pt->radius * ((pt->flags & GSP_OVL_SCREEN) ? 1 : c.zoom));
+            memcpy(ds->rgba, pt->rgba, 4);
+        }
+        free(ord);
+    }
+
+    /* Labels: at the position's screen point plus (dx, dy), hidden with it. */
+    for (uint32_t i = 0; i < o->nt; i++) {
+        const gsp_ovl_label_t *lb = &o->labels[i];
+        double sx, sy, z;
+        if (!lb->text[0]) continue;
+        if (!ovl_project(&c, lb->pos, lb->flags, &sx, &sy, &z)) continue;
+        if (!ovl_visible(&c, sx, sy, z, lb->flags)) continue;
+        GROW(d->text, d->ntext, d->textcap);
+        gsp_ovl_text_t *t = &d->text[d->ntext++];
+        t->x = (float)(sx + lb->dx); t->y = (float)(sy + lb->dy);
+        memcpy(t->rgb, lb->rgb, 3);
+        t->text = lb->text;
+    }
+    return 0;
+}
+
+void gsp_ovl_draw_free(gsp_ovl_draw_t *d)
+{
+    if (!d) return;
+    free(d->seg); free(d->disc); free(d->text);
+    memset(d, 0, sizeof *d);
 }

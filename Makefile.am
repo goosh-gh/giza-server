@@ -61,6 +61,9 @@ if USE_COCOA
 giza_server_SOURCES = \
     viewer/giza-server-cocoa.m \
     viewer/giza-server-main.m \
+    viewer/gsp_scene3d.c \
+    viewer/gsp_scene3d.h \
+    viewer/gsp_raster.h \
     viewer/giza-server-protocol.h \
     viewer/gsp_3d.h
 # -x objective-c is embedded in COCOA_CFLAGS from configure.ac

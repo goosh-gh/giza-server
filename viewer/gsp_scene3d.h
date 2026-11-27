@@ -44,15 +44,43 @@ typedef struct {
     uint8_t  *lit;             /* [nv][3] shaded colour */
 } gsp_mesh3d_t;
 
+/* The overlay of GSP_MSG_3D_OVERLAY, unpacked (see gsp_3d.h). */
+typedef struct { float pos[3], radius; uint8_t rgba[4], flags; } gsp_ovl_point_t;
+typedef struct { float p0[3], p1[3], width; uint8_t rgba[4], flags; } gsp_ovl_line_t;
+typedef struct { float pos[3], dx, dy; uint8_t rgb[3], flags; const char *text; } gsp_ovl_label_t;
+
+typedef struct {
+    float            eps;
+    uint32_t         np, nl, nt;
+    gsp_ovl_point_t *pts;
+    gsp_ovl_line_t  *lines;
+    gsp_ovl_label_t *labels;
+    char            *text;     /* the labels' texts, each NUL-terminated */
+} gsp_overlay3d_t;
+
 typedef struct {
     gsp_3d_view_t view;
     double        light[3];    /* unnormalised direction, view space */
     double        ambient;
     gsp_mesh3d_t  mesh[GSP_SCENE3D_MAX_MESH];
+    gsp_overlay3d_t ovl;
     gsp_3d_tri_t *tris;        /* scratch for one frame */
     uint32_t     *tri_id;
     size_t        tri_cap;
 } gsp_scene3d_t;
+
+/* What a backend draws for the overlay, in window pixels (x right, y down),
+ * in this order: segments, discs, texts. A segment with band set is a filled
+ * rectangle x0..x1, y0..y0 + width; otherwise a stroke of that width. A text
+ * is drawn with its baseline starting at (x, y). */
+typedef struct { float x0, y0, x1, y1, width; uint8_t rgba[4]; uint8_t band; } gsp_ovl_seg_t;
+typedef struct { float x, y, r; uint8_t rgba[4]; } gsp_ovl_disc_t;
+typedef struct { float x, y; uint8_t rgb[3]; const char *text; } gsp_ovl_text_t;
+typedef struct {
+    gsp_ovl_seg_t  *seg;  size_t nseg,  segcap;
+    gsp_ovl_disc_t *disc; size_t ndisc, disccap;
+    gsp_ovl_text_t *text; size_t ntext, textcap;
+} gsp_ovl_draw_t;
 
 /* A new scene: default view (Cz from above, zoom 1, pivot 0, perspective),
  * GS3D's light and ambient. Free with gsp_scene3d_free. */
@@ -63,6 +91,16 @@ void gsp_scene3d_free(gsp_scene3d_t *sc);
 int gsp_scene3d_set_mesh(gsp_scene3d_t *sc, const void *payload, size_t len);
 int gsp_scene3d_set_colors(gsp_scene3d_t *sc, const void *payload, size_t len);
 int gsp_scene3d_set_view(gsp_scene3d_t *sc, const void *payload, size_t len);
+int gsp_scene3d_set_overlay(gsp_scene3d_t *sc, const void *payload, size_t len);
+
+/* The overlay as drawing commands for a w x h window, after
+ * gsp_scene3d_render drew the meshes into zb (same w, h). zb NULL: nothing is
+ * hidden. The texts point into the scene (valid until the next overlay).
+ * Reuses out's arrays; start from a zeroed gsp_ovl_draw_t and release it with
+ * gsp_ovl_draw_free. Returns 0, or -1 if memory ran out. */
+int gsp_scene3d_overlay_draw(const gsp_scene3d_t *sc, int w, int h, const float *zb,
+                             gsp_ovl_draw_t *out);
+void gsp_ovl_draw_free(gsp_ovl_draw_t *d);
 
 /* Rotate as a drag of (dx, dy) screen pixels does in GS3D (dy: up positive). */
 void gsp_scene3d_drag(gsp_scene3d_t *sc, double dx, double dy);
